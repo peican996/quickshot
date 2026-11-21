@@ -213,6 +213,15 @@ static void QSLog(const char *fmt, ...)
     fflush(g_logf);
 }
 
+/* 高精度计时（微秒）：自检里的性能对比不能依赖 15.6ms 粒度的 GetTickCount64 */
+static ULONGLONG NowUsec(void)
+{
+    LARGE_INTEGER f, c;
+    if (!QueryPerformanceFrequency(&f) || f.QuadPart == 0) return 0;
+    QueryPerformanceCounter(&c);
+    return (ULONGLONG)((double)c.QuadPart * 1000000.0 / (double)f.QuadPart);
+}
+
 static void GetExePath(WCHAR *buf, DWORD n)
 {
     GetModuleFileNameW(NULL, buf, n);
@@ -284,37 +293,128 @@ static int g_gdiSelectFailures;
 static int g_gdiRestoreFailures;
 static int g_gdiReleaseFailures;
 
-/* 延迟释放队列：恢复原对象失败、stock 顶出也失败时，临时对象仍被 DC 引用，
- * 此时 DeleteObject 必然失败。不能就这样丢掉句柄——记录「对象 + 所属 DC」，
- * 等该 DC 被 DeleteDC 之后再重试删除。队列很小，满了就明确记日志。 */
-#define GDI_DEFER_MAX 16
-typedef struct { HGDIOBJ obj; HDC hdc; } GdiDeferred;
+/* 延迟释放队列。
+ *
+ * 场景：恢复原对象失败、stock 顶出也失败时，临时对象仍被某些 DC 引用，
+ * 此时 DeleteObject 必然失败。句柄不能丢——登记到这里，等引用它的 DC 销毁后重试。
+ *
+ * 所有权规则：
+ *   - 登记成功（返回 TRUE）后，句柄所有权归队列，调用方不得再释放；
+ *   - 只有 DeleteObject 成功（或对象已不存在）才从队列移除；
+ *   - 队列按需翻倍扩容，不设固定上限；
+ *   - 扩容失败时先落到固定紧急槽；连紧急槽也满才记 ERROR 并累加丢失计数
+ *     （不静默，计数器会被自检/监控看到）；
+ *   - 只保存句柄，不保存 DC：本队列绝不销毁任何 DC，
+ *     “是否还能删”只由 DeleteObject 的返回值决定。
+ */
+static HGDIOBJ *g_gdiDefer;              /* 动态数组，仅存句柄 */
+static int      g_gdiDeferredCount;
+static int      g_gdiDeferredCap;
+static int      g_gdiDeferredDone;       /* 延迟队列里最终成功释放的数量 */
 
-static GdiDeferred g_gdiDeferred[GDI_DEFER_MAX];
-static int          g_gdiDeferredCount;
-static int          g_gdiDeferredDone;   /* 自检统计：延迟队列里最终成功释放的数量 */
+#define GDI_DEFER_EMERGENCY 8
+static HGDIOBJ g_gdiDeferEmergency[GDI_DEFER_EMERGENCY];
+static int     g_gdiDeferEmergencyCount;
 
-/* 尝试清空延迟队列中已经可以释放的对象。
- * 不主动销毁任何 DC：只对“DC 已销毁（对象不再被引用）”的条目重试 DeleteObject。 */
+static int g_gdiDeferAllocFailures;      /* 扩容失败次数（走紧急槽） */
+static int g_gdiDeferLostHandles;        /* 连紧急槽都满、确实无法保留的次数 */
+static int g_gdiDeferInjectAllocFail;    /* 自检注入：下一次扩容失败 */
+
+static BOOL GdiDeferContains(HGDIOBJ obj)
+{
+    for (int i = 0; i < g_gdiDeferredCount; i++)
+        if (g_gdiDefer[i] == obj) return TRUE;
+    for (int i = 0; i < g_gdiDeferEmergencyCount; i++)
+        if (g_gdiDeferEmergency[i] == obj) return TRUE;
+    return FALSE;
+}
+
+/* 登记一个暂时删不掉的对象；返回 TRUE 表示所有权已转移给队列 */
+static BOOL GdiDeferRetain(HGDIOBJ obj)
+{
+    if (!obj) return TRUE;
+
+    if (GdiDeferContains(obj)) {         /* 去重：同一句柄只登记一次 */
+        QSLog("GdiDeferRetain: obj=%p 已在队列中，忽略重复登记", (void *)obj);
+        return TRUE;
+    }
+
+    if (g_gdiDeferredCount == g_gdiDeferredCap) {
+        int cap = g_gdiDeferredCap ? g_gdiDeferredCap * 2 : 8;
+        HGDIOBJ *grown = NULL;
+
+        if (!g_gdiDeferInjectAllocFail)
+            grown = (HGDIOBJ *)realloc(g_gdiDefer, (size_t)cap * sizeof(HGDIOBJ));
+
+        if (!grown) {
+            /* 兜底：先用固定紧急槽，保证句柄不丢 */
+            g_gdiDeferAllocFailures++;
+            if (g_gdiDeferEmergencyCount < GDI_DEFER_EMERGENCY) {
+                g_gdiDeferEmergency[g_gdiDeferEmergencyCount++] = obj;
+                QSLog("GdiDeferRetain: 扩容失败，obj=%p 转入紧急槽", (void *)obj);
+                return TRUE;
+            }
+            g_gdiDeferLostHandles++;
+            QSLog("GdiDeferRetain: ERROR 紧急槽已满，obj=%p 无法保留（计数=%d）",
+                  (void *)obj, g_gdiDeferLostHandles);
+            return FALSE;
+        }
+        g_gdiDefer       = grown;
+        g_gdiDeferredCap = cap;
+    }
+
+    g_gdiDefer[g_gdiDeferredCount++] = obj;
+    return TRUE;
+}
+
+/* 尝试释放队列里已经可以删的对象。
+ * 不主动销毁任何 DC：只对“已不再被任何 DC 引用”的条目重试 DeleteObject。 */
 static void GdiFlushDeferred(void)
 {
     int i = 0;
     while (i < g_gdiDeferredCount) {
-        HGDIOBJ obj = g_gdiDeferred[i].obj;
+        HGDIOBJ obj = g_gdiDefer[i];
         BOOL gone = (!obj || GetObjectType(obj) == 0);
 
-        if (!gone && DeleteObject(obj)) {   /* DC 已不复存在，这次能删掉了 */
+        if (!gone && DeleteObject(obj)) {
             gone = TRUE;
             g_gdiDeferredDone++;
             QSLog("GdiFlushDeferred: 延迟对象 obj=%p 已释放", (void *)obj);
         }
 
-        if (gone) {
-            g_gdiDeferred[i] = g_gdiDeferred[--g_gdiDeferredCount];
-        } else {
-            i++;
-        }
+        if (gone) g_gdiDefer[i] = g_gdiDefer[--g_gdiDeferredCount];
+        else      i++;
     }
+
+    i = 0;
+    while (i < g_gdiDeferEmergencyCount) {
+        HGDIOBJ obj = g_gdiDeferEmergency[i];
+        BOOL gone = (!obj || GetObjectType(obj) == 0);
+
+        if (!gone && DeleteObject(obj)) {
+            gone = TRUE;
+            g_gdiDeferredDone++;
+            QSLog("GdiFlushDeferred: 紧急槽对象 obj=%p 已释放", (void *)obj);
+        }
+
+        if (gone) g_gdiDeferEmergency[i] = g_gdiDeferEmergency[--g_gdiDeferEmergencyCount];
+        else      i++;
+    }
+}
+
+/* 进程退出时调用：再试一次，然后释放队列本身。
+ * 仍有残留说明有 DC 没被销毁，只记录不强行处理。 */
+static void GdiDeferReleaseAll(void)
+{
+    GdiFlushDeferred();
+    if (g_gdiDeferredCount > 0 || g_gdiDeferEmergencyCount > 0) {
+        QSLog("GdiDeferReleaseAll: 退出时仍有 %d+%d 个对象未能释放",
+              g_gdiDeferredCount, g_gdiDeferEmergencyCount);
+    }
+    free(g_gdiDefer);
+    g_gdiDefer           = NULL;
+    g_gdiDeferredCount   = 0;
+    g_gdiDeferredCap     = 0;
 }
 
 static BOOL GdiSelect(HDC hdc, HGDIOBJ obj, HGDIOBJ *old)
@@ -411,14 +511,12 @@ static BOOL GdiRelease(HDC hdc, HGDIOBJ obj, HGDIOBJ old, int stockFallback, con
             deleted = DeleteObject(obj) ? TRUE : FALSE;
         }
         if (!deleted) {
-            QSLog("GdiRelease(%s): DeleteObject FAIL obj=%p，转入延迟释放", ctx, (void *)obj);
-            if (g_gdiDeferredCount < GDI_DEFER_MAX) {
-                g_gdiDeferred[g_gdiDeferredCount].obj = obj;
-                g_gdiDeferred[g_gdiDeferredCount].hdc = hdc;
-                g_gdiDeferredCount++;
-            } else {
-                QSLog("GdiRelease(%s): 延迟队列已满，obj=%p 无法登记", ctx, (void *)obj);
-            }
+            /* 句柄不能丢：登记成功即由队列持有，调用方不得再释放 */
+            if (GdiDeferRetain(obj))
+                QSLog("GdiRelease(%s): obj=%p 已转入延迟释放队列", ctx, (void *)obj);
+            else
+                QSLog("GdiRelease(%s): ERROR obj=%p 无法登记（已计入丢失计数）",
+                      ctx, (void *)obj);
         }
     }
 
@@ -3711,23 +3809,25 @@ static void TestMosaic(HWND parent)
     ULONGLONG dtCached = 0, dtDirect = 0;
     if (ddc) {
         DrawAnnotations(ddc);                       /* 先建缓存 */
-        ULONGLONG t0 = GetTickCount64();
+        ULONGLONG t0 = NowUsec();
         for (int i = 0; i < 500; i++) DrawAnnotations(ddc);
-        dtCached = GetTickCount64() - t0;
+        dtCached = NowUsec() - t0;
 
-        ULONGLONG t1 = GetTickCount64();
+        ULONGLONG t1 = NowUsec();
         for (int i = 0; i < 500; i++) {
             MosaicEpochBump();
             DrawAnnotations(ddc);
         }
-        dtDirect = GetTickCount64() - t1;
+        dtDirect = NowUsec() - t1;
 
         GdiRestore(ddc, dold, "mosaic bench bitmap");
         DeleteDC(ddc);
     }
     if (dhbm) DeleteObject(dhbm);
-    printf("mosaic: annots 500x cached %llu ms, 500x uncached %llu ms\n",
+    printf("mosaic: annots 500x cached %llu us, 500x uncached %llu us\n",
            (unsigned long long)dtCached, (unsigned long long)dtDirect);
+    /* 用微秒计时：GetTickCount64 的 15.6ms 粒度会让两条路径都落在同一刻度上，
+     * 造成随机误判。缓存命中本就不该比强制重算慢。 */
     TestCheck(dtCached <= dtDirect, "mosaic cache is not slower than recompute");
 
     /* 3) 预览 vs 导出：选区内容逐像素比较，不做抽样。
@@ -4560,6 +4660,107 @@ static void TestGdiDeferredRelease(void)
     TestCheck(GdiCount() <= g0, "defer: no gdi growth after deferred release");
 }
 
+/* 超过原 16 个上限的批量延迟释放：队列必须动态扩容，DC 销毁后全部回收 */
+static void TestGdiDeferredBulk(void)
+{
+    TestSurface s;
+    if (!TestSurfaceCreate(&s, 8, 8)) { TestCheck(FALSE, "defer bulk: surface"); return; }
+
+    DWORD g0 = GdiCount();
+    int base  = g_gdiDeferredCount;
+    int done0 = g_gdiDeferredDone;
+
+    /* 依次选入再登记：这些对象在 DC 销毁前都无法删除，要在队列里堆到 40 条。
+     * 这里直接登记而不是走 GdiRelease，因为 GdiRelease 每次入口都会先 flush，
+     * 会立刻释放掉上一条已经不在 DC 里的对象（单对象路径由 TestGdiDeferredRelease 覆盖）。 */
+    int made = 0;
+    for (int i = 0; i < 40; i++) {
+        HPEN p = CreatePen(PS_SOLID, 1, RGB(i, 0, 0));
+        if (!p) break;
+        HGDIOBJ old = NULL;
+        if (!GdiSelect(s.dc, p, &old)) { DeleteObject(p); break; }
+        if (!GdiDeferRetain(p)) { DeleteObject(p); break; }
+        made++;
+    }
+
+    printf("defer bulk: made=%d queued=%d (base %d, cap %d)\n",
+           made, g_gdiDeferredCount, base, g_gdiDeferredCap);
+    TestCheck(made == 40, "defer bulk: 40 objects created and deferred");
+    TestCheck(g_gdiDeferredCount == base + 40, "defer bulk: queue grew past the old 16 limit");
+    TestCheck(g_gdiDeferredCap >= 40, "defer bulk: backing array expanded");
+
+    TestSurfaceDestroy(&s);                 /* DC 销毁后统一重试 */
+    printf("defer bulk: after destroy queued=%d freed=%d\n",
+           g_gdiDeferredCount, g_gdiDeferredDone - done0);
+    TestCheck(g_gdiDeferredCount == base, "defer bulk: queue drained after DC destroyed");
+    TestCheck(g_gdiDeferredDone - done0 == 40, "defer bulk: all 40 objects released");
+    TestCheck(GdiCount() <= g0, "defer bulk: no gdi growth");
+}
+
+/* 同一句柄重复登记只保留一条，且最终只释放一次 */
+static void TestGdiDeferredDuplicate(void)
+{
+    HPEN p = CreatePen(PS_SOLID, 1, RGB(1, 2, 3));
+    if (!p) { TestCheck(FALSE, "defer dup: create pen"); return; }
+
+    DWORD g0 = GdiCount();
+    int base  = g_gdiDeferredCount;
+    int done0 = g_gdiDeferredDone;
+
+    BOOL a = GdiDeferRetain(p);
+    BOOL b = GdiDeferRetain(p);
+    printf("defer dup: first=%d second=%d queued=%d (base %d)\n",
+           a, b, g_gdiDeferredCount, base);
+    TestCheck(a && b, "defer dup: duplicate registration is accepted silently");
+    TestCheck(g_gdiDeferredCount == base + 1, "defer dup: only one entry kept");
+
+    GdiFlushDeferred();                     /* 未被选入，可以直接删 */
+    TestCheck(g_gdiDeferredCount == base, "defer dup: released exactly once");
+    TestCheck(g_gdiDeferredDone == done0 + 1, "defer dup: free counted once");
+    TestCheck(GdiCount() <= g0, "defer dup: no gdi growth");
+}
+
+/* 队列扩容失败：必须落到紧急槽，句柄不能丢 */
+static void TestGdiDeferredAllocFailure(void)
+{
+    DWORD g0 = GdiCount();
+    int base  = g_gdiDeferredCount;
+    int emg0  = g_gdiDeferEmergencyCount;
+    int fail0 = g_gdiDeferAllocFailures;
+    int done0 = g_gdiDeferredDone;
+
+    /* 先把动态队列填到容量上限，确保下一次登记一定会尝试扩容 */
+    while (g_gdiDeferredCount < g_gdiDeferredCap) {
+        HPEN f = CreatePen(PS_SOLID, 1, RGB(4, 4, 4));
+        if (!f) break;
+        if (!GdiDeferRetain(f)) { DeleteObject(f); break; }
+    }
+    int filled = g_gdiDeferredCount - base;
+
+    HPEN target = CreatePen(PS_SOLID, 1, RGB(5, 5, 5));
+    if (!target) {
+        GdiFlushDeferred();
+        TestCheck(FALSE, "defer alloc: create target pen");
+        return;
+    }
+
+    g_gdiDeferInjectAllocFail = 1;
+    BOOL ok = GdiDeferRetain(target);
+    g_gdiDeferInjectAllocFail = 0;
+
+    printf("defer alloc: filled=%d retained=%d emergency=%d allocFails=%d\n",
+           filled, ok, g_gdiDeferEmergencyCount, g_gdiDeferAllocFailures);
+    TestCheck(ok && g_gdiDeferEmergencyCount == emg0 + 1 &&
+              g_gdiDeferAllocFailures == fail0 + 1,
+              "defer alloc: allocation failure falls back to emergency slot");
+
+    GdiFlushDeferred();                     /* 全部未被选入，可正常释放 */
+    TestCheck(g_gdiDeferEmergencyCount == emg0, "defer alloc: emergency entry released");
+    TestCheck(g_gdiDeferredCount == base, "defer alloc: main queue returns to baseline");
+    TestCheck(g_gdiDeferredDone - done0 == filled + 1, "defer alloc: all retained objects freed");
+    TestCheck(GdiCount() <= g0, "defer alloc: no gdi growth");
+}
+
 /* 绘制过程中恢复失败：不能影响后续绘制的 DC 状态 */
 static void TestGdiRestoreFailureDrawing(void)
 {
@@ -4750,6 +4951,9 @@ static int RunStabilityTest(void)
     TestGdiLifecycle();
     TestTextAnnotSelectFailure();
     TestGdiDeferredRelease();
+    TestGdiDeferredBulk();
+    TestGdiDeferredDuplicate();
+    TestGdiDeferredAllocFailure();
     TestGdiRestoreFailureDrawing();
     TestRestoreOldBmp();
 
@@ -4764,10 +4968,15 @@ static int RunStabilityTest(void)
     printf("=== gdi total: %lu -> %lu ===\n", g0, g1);
     TestCheck(g1 <= g0, "no gdi leak across whole run");
 
-    printf("=== gdi failures: select=%d restore=%d release=%d deferred=%d freed=%d ===\n",
+    printf("=== gdi failures: select=%d restore=%d release=%d deferred=%d(emg %d) freed=%d allocFail=%d lost=%d ===\n",
            g_gdiSelectFailures, g_gdiRestoreFailures, g_gdiReleaseFailures,
-           g_gdiDeferredCount, g_gdiDeferredDone);
-    TestCheck(g_gdiDeferredCount == 0, "no pending deferred gdi objects at exit");
+           g_gdiDeferredCount, g_gdiDeferEmergencyCount, g_gdiDeferredDone,
+           g_gdiDeferAllocFailures, g_gdiDeferLostHandles);
+    TestCheck(g_gdiDeferredCount == 0 && g_gdiDeferEmergencyCount == 0,
+              "no pending deferred gdi objects at exit");
+    TestCheck(g_gdiDeferLostHandles == 0, "no gdi handle lost during whole run");
+
+    GdiDeferReleaseAll();                  /* 释放延迟队列自身的内存 */
 
     printf("=== %s (%d failures) ===\n", g_testFail ? "FAILED" : "OK", g_testFail);
     fflush(stdout);

@@ -383,3 +383,131 @@ gdi pen loop: second 1000x, gdi 38 -> 38
 | 2 | `GetObjectType` 不能证明句柄已回收 | 改用 GDI 总量与队列计数作为判据 |
 | 3 | 注入开关存在于产品代码 | 常量恒为 0，仅自检写入；如需可编译期裁掉 |
 
+---
+
+## 9. 最终收尾（`v1.1.2`）：延迟释放队列动态扩容与所有权闭环
+
+基线：`d67d277`。本轮只改延迟释放队列与相关测试，不动其他功能。
+
+### 9.1 队列新设计
+
+[`shot.c#L287-L409`](file:///C:/code/quickshot/shot.c#L287-L409)
+
+```c
+static HGDIOBJ *g_gdiDefer;        /* 动态数组，只存句柄 */
+static int      g_gdiDeferredCount;
+static int      g_gdiDeferredCap;  /* 按需翻倍：8 → 16 → 32 → 64 … */
+static HGDIOBJ  g_gdiDeferEmergency[8];   /* 扩容失败时的兜底槽 */
+```
+
+| 设计点 | 做法 |
+|---|---|
+| 容量 | 无固定上限，`count == cap` 时按 2 倍扩容（首次 8） |
+| 扩容失败 | 落入 8 个固定紧急槽，`g_gdiDeferAllocFailures++`，日志记录 |
+| 紧急槽也满 | `g_gdiDeferLostHandles++` 并写 ERROR 日志，**不静默** |
+| 去重 | `GdiDeferContains()` 同时检查主队列与紧急槽，同一句柄只登记一次 |
+| 存储字段 | **只存句柄，不再保存 HDC**：队列从不销毁 DC，能否删除只由 `DeleteObject` 结果决定，避免对 DC 生命周期产生错误假设 |
+| 移除条件 | 只有 `DeleteObject` 成功（或对象已不存在）才移除 |
+| 进程退出 | `GdiDeferReleaseAll()` 再试一次并释放数组；仍有残留则记日志，不强行处理 |
+
+**所有权规则**
+
+1. `GdiDeferRetain()` 返回 `TRUE` → 句柄所有权转移给队列，调用方（`GdiRelease`）不得再释放；
+2. 返回 `FALSE`（紧急槽也满）→ 调用方仍无权释放，句柄已计入丢失计数并写 ERROR 日志；
+3. 队列只在真正删除成功后放弃句柄；
+4. `GdiRelease` 的返回值仍为 `restored && deleted`，登记成功不代表“已释放”，只代表“已托管”。
+
+### 9.2 `GdiRelease` 各失败路径
+
+| 情况 | 句柄归属 / 处理 |
+|---|---|
+| 恢复成功、删除成功 | 已释放，返回 TRUE |
+| 恢复成功、删除失败 | 登记队列（或紧急槽），返回 FALSE |
+| 恢复失败、stock 顶出成功 | 顶出后删除；删除成败同上，返回值仍为 FALSE |
+| 恢复失败、stock 顶出失败 | 直接尝试删除；失败则登记队列 |
+| 恢复失败、`stockFallback = -1` | 直接尝试删除；失败则登记队列（位图类走 `DeleteDC` 路径） |
+| 登记成功 | 队列持有；之后由 `GdiFlushDeferred()` 重试 |
+| 登记失败（紧急槽满） | `g_gdiDeferLostHandles++` + ERROR 日志，绝不假装成功 |
+| 重试仍未成功 | 保留在队列，下次 flush 继续 |
+| 重试成功 | 移出队列，`g_gdiDeferredDone++` |
+
+### 9.3 新增测试与实测输出
+
+| 用例 | 覆盖点 |
+|---|---|
+| `defer: ...`（原有） | 恢复失败 + stock 无替代 + 删除失败 → 登记 → DC 销毁后释放 |
+| `TestGdiDeferredBulk` | **40 条**延迟任务，验证超出原 16 上限后自动扩容、DC 销毁后全部回收 |
+| `TestGdiDeferredDuplicate` | 同一句柄登记两次只保留一条、只释放一次 |
+| `TestGdiDeferredAllocFailure` | 注入扩容失败 → 落紧急槽 → 仍能释放 |
+| `TestGdiLifecycle` | 正常恢复/删除、恢复失败识别、stock 顶出、1000 次字体/画笔循环 |
+| `TestGdiRestoreFailureDrawing` | 恢复失败后继续绘制，像素与参照图完全一致 |
+| `TestRestoreOldBmp` | 缓冲分配/释放、原对象失效时的清理路径 |
+
+```text
+defer: selected=1 released=0 deferredCount=1 (base 0) objType=1
+[PASS] defer: release reports failure
+[PASS] defer: un-deletable object is retained
+[PASS] defer: handle still valid before DC teardown
+[PASS] defer: queue drained after DC destroyed
+[PASS] defer: deferred object finally released
+[PASS] defer: no gdi growth after deferred release
+defer bulk: made=40 queued=40 (base 0, cap 64)
+[PASS] defer bulk: 40 objects created and deferred
+[PASS] defer bulk: queue grew past the old 16 limit
+[PASS] defer bulk: backing array expanded
+defer bulk: after destroy queued=0 freed=40
+[PASS] defer bulk: queue drained after DC destroyed
+[PASS] defer bulk: all 40 objects released
+[PASS] defer bulk: no gdi growth
+defer dup: first=1 second=1 queued=1 (base 0)
+[PASS] defer dup: duplicate registration is accepted silently
+[PASS] defer dup: only one entry kept
+[PASS] defer dup: released exactly once
+[PASS] defer dup: free counted once
+[PASS] defer dup: no gdi growth
+defer alloc: filled=64 retained=1 emergency=1 allocFails=1
+[PASS] defer alloc: allocation failure falls back to emergency slot
+[PASS] defer alloc: emergency entry released
+[PASS] defer alloc: main queue returns to baseline
+[PASS] defer alloc: all retained objects freed
+[PASS] defer alloc: no gdi growth
+draw fail: gdi 39 -> 40 -> 40 (100 injected draws)
+draw fail: pixels compared=2304 diff=0
+=== gdi total: 35 -> 31 ===
+=== gdi failures: select=4 restore=107 release=2 deferred=0(emg 0) freed=107 allocFail=1 lost=0 ===
+[PASS] no pending deferred gdi objects at exit
+[PASS] no gdi handle lost during whole run
+```
+
+`select=4` / `restore=107` / `release=2` / `allocFail=1` 全部来自自检刻意构造；`lost=0` 表示整个运行期间没有任何句柄因队列满而丢失。
+
+### 9.4 顺带修正的一处测试缺陷
+
+马赛克缓存性能对比原先用 `GetTickCount64`（15.6ms 粒度）跑 500 次，两条路径常常落在同一刻度（实测 `16 ms vs 15 ms`）导致随机误判。改为 `QueryPerformanceCounter` 微秒计时后结果稳定：
+
+```text
+mosaic: annots 500x cached 3068 us, 500x uncached 20992 us
+```
+
+### 9.5 回归结果
+
+| 命令 | 退出码 | 结果 |
+|---|---|---|
+| `--stress-test` | 0 | **107 PASS / 0 FAIL**（连续两次一致） |
+| `--capture-test` | 0 | 2560×1440、`png: ok`、热键可用 |
+| `--toolbar-test` | 0 | `out-of-bounds: 0`、`cursor mismatches: 0` |
+| `--demo` | 0 | SHA256 `A8D9086C…28F2`，与此前各轮逐字节一致 |
+
+其他回归点：马赛克预览/导出仍为逐像素 0 差异（196,144 px）；快捷键启动回退 4 项用例全部通过；正常渲染阶段 GDI 失败计数为 0；`-Wall` 无新增告警；整体 GDI 35 → 31，无持续增长。
+
+### 9.6 尚未解决的风险
+
+| # | 风险 | 说明 |
+|---|---|---|
+| 1 | 紧急槽仅 8 个 | 动态扩容失败且同时有 >8 个待托管对象时，仍会丢失并计数；正常路径不会进入 |
+| 2 | 无法模拟真实 OOM | 扩容失败用注入开关验证；真实内存耗尽下的 `realloc` 行为未实测 |
+| 3 | 注入开关位于产品代码 | 常量恒为 0，仅自检写入 |
+| 4 | 延迟队列不在崩溃路径上生效 | 进程被强杀时队列随进程消失，属预期 |
+| 5 | `shot.c` 单文件约 5000 行（含自检） | 按约定不再扩大本轮范围，模块化留到后续 |
+
+
