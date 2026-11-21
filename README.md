@@ -4,6 +4,8 @@ Windows 上的极简截图工具。**单个 exe 74 KB，常驻内存约 2.8 MB**
 
 按下 `Ctrl+Alt+A` 就能框选、标注、复制、保存。
 
+![截图界面](docs/overlay.png)
+
 ## 功能
 
 **截图**
@@ -15,6 +17,8 @@ Windows 上的极简截图工具。**单个 exe 74 KB，常驻内存约 2.8 MB**
 
 **标注**
 
+![七种标注](docs/annotations.png)
+
 | 工具 | 说明 |
 |---|---|
 | 画笔 | 自由圈画，轨迹平滑 |
@@ -25,8 +29,12 @@ Windows 上的极简截图工具。**单个 exe 74 KB，常驻内存约 2.8 MB**
 | 文字 | 支持中文输入法，点已有文字可**二次编辑** |
 | 序号 | 点一下放一个，编号自动递增，撤销会退号 |
 
+工具条分两行，工具在上、颜色和粗细在下：
+
+![工具条](docs/toolbar.png)
+
 - 5 种颜色（红 / 黄 / 绿 / 蓝 / 白）
-- 3 档粗细（同时也是字号档位）
+- 3 档粗细（同时决定字号和序号圆圈大小）
 - 撤销：`Ctrl+Z` 或工具条按钮
 
 **其它**
@@ -61,19 +69,21 @@ gcc -O2 -s -Wall -mwindows shot.c app.res -o snapshot.exe ^
 
 | 文件 | 内容 |
 |---|---|
-| `shot.c` | 全部源码（约 2900 行，单文件） |
+| `shot.c` | 全部源码（约 3000 行，单文件） |
 | `app.rc` / `app.ico` | 图标资源 |
 | `build.bat` | 一键编译脚本 |
+| `docs/` | README 配图 |
 
 `app.res` 和 `snapshot.exe` 是编译产物，不在版本库内。
 
 ## 自检
 
-程序内置两个离屏自检，不需要真实截图就能验证渲染链路：
+程序内置三个离屏自检，不需要真的截图就能验证渲染链路：
 
 ```bat
-snapshot.exe --capture-test      :: 把 7 种标注烘焙成 selftest.png
-snapshot.exe --toolbar-test      :: 把工具条渲染成 toolbar.png，并校验按钮坐标与光标判定
+snapshot.exe --capture-test            :: 把 7 种标注烘焙成 selftest.png
+snapshot.exe --toolbar-test            :: 渲染工具条并校验按钮坐标与光标判定
+snapshot.exe --demo bg.png out.png     :: 用指定图片合成一张界面示意图
 ```
 
 ## 已知限制

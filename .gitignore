@@ -2,12 +2,13 @@
 *.exe
 *.o
 *.obj
-app.res
+/app.res
 
-# 自检 / 调试输出
+# 自检 / 调试输出的临时图（docs 里的正式配图要保留）
 *.log
-selftest.png
-toolbar.png
+/selftest.png
+/toolbar.png
+/docs/_*.png
 
 # 编辑器
 .vscode/

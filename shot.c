@@ -337,6 +337,68 @@ static void ResolveSaveDir(void)
 
 /* ---------------------------------------------------------------- 捕获 */
 
+/* 分配三份缓冲：原始 / 变暗底图 / 绘制后备 */
+static BOOL OvAllocBuffers(int w, int h)
+{
+    HDC hdcScreen = GetDC(NULL);
+    if (!hdcScreen) return FALSE;
+
+    BITMAPINFO bi;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = w;
+    bi.bmiHeader.biHeight      = -h;            /* top-down */
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    g_ov.hbmCap  = CreateDIBSection(hdcScreen, &bi, DIB_RGB_COLORS, &g_ov.pixCap, NULL, 0);
+    g_ov.hbmDim  = CreateDIBSection(hdcScreen, &bi, DIB_RGB_COLORS, NULL, NULL, 0);
+    g_ov.hbmBack = CreateDIBSection(hdcScreen, &bi, DIB_RGB_COLORS, NULL, NULL, 0);
+    if (!g_ov.hbmCap || !g_ov.hbmDim || !g_ov.hbmBack) {
+        ReleaseDC(NULL, hdcScreen);
+        return FALSE;
+    }
+
+    g_ov.hdcCap  = CreateCompatibleDC(hdcScreen);
+    g_ov.hdcDim  = CreateCompatibleDC(hdcScreen);
+    g_ov.hdcBack = CreateCompatibleDC(hdcScreen);
+    ReleaseDC(NULL, hdcScreen);
+    if (!g_ov.hdcCap || !g_ov.hdcDim || !g_ov.hdcBack) return FALSE;
+
+    SelectObject(g_ov.hdcCap,  g_ov.hbmCap);
+    SelectObject(g_ov.hdcDim,  g_ov.hbmDim);
+    SelectObject(g_ov.hdcBack, g_ov.hbmBack);
+    return TRUE;
+}
+
+/* 由 hdcCap 生成变暗底图（约 45% 亮度），并把原图 alpha 归位 */
+static void OvDimBuffers(void)
+{
+    BitBlt(g_ov.hdcDim, 0, 0, g_ov.vw, g_ov.vh, g_ov.hdcCap, 0, 0, SRCCOPY);
+
+    BITMAP bm;
+    if (GetObjectW(g_ov.hbmDim, sizeof(bm), &bm)) {
+        BYTE *dst = (BYTE *)bm.bmBits;
+        if (dst) {
+            size_t n = (size_t)g_ov.vw * g_ov.vh;
+            for (size_t i = 0; i < n; i++) {
+                BYTE *p = dst + i * 4;
+                p[0] = (BYTE)(p[0] * 45 / 100);
+                p[1] = (BYTE)(p[1] * 45 / 100);
+                p[2] = (BYTE)(p[2] * 45 / 100);
+                p[3] = 255;
+            }
+        }
+    }
+
+    BYTE *cap = (BYTE *)g_ov.pixCap;
+    if (cap) {
+        size_t n = (size_t)g_ov.vw * g_ov.vh;
+        for (size_t i = 0; i < n; i++) cap[i * 4 + 3] = 255;
+    }
+}
+
 static BOOL CaptureVirtualScreen(void)
 {
     ZeroMemory(&g_ov, sizeof(g_ov));
@@ -347,35 +409,10 @@ static BOOL CaptureVirtualScreen(void)
     g_ov.vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
     if (g_ov.vw <= 0 || g_ov.vh <= 0) return FALSE;
 
+    if (!OvAllocBuffers(g_ov.vw, g_ov.vh)) return FALSE;
+
     HDC hdcScreen = GetDC(NULL);
     if (!hdcScreen) return FALSE;
-
-    BITMAPINFO bi;
-    ZeroMemory(&bi, sizeof(bi));
-    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth       = g_ov.vw;
-    bi.bmiHeader.biHeight      = -g_ov.vh;      /* top-down */
-    bi.bmiHeader.biPlanes      = 1;
-    bi.bmiHeader.biBitCount    = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-
-    g_ov.hbmCap = CreateDIBSection(hdcScreen, &bi, DIB_RGB_COLORS, &g_ov.pixCap, NULL, 0);
-    if (!g_ov.hbmCap) { ReleaseDC(NULL, hdcScreen); return FALSE; }
-
-    /* 三份缓冲：原始、变暗底图、绘制用后备 */
-    g_ov.hbmDim  = CreateDIBSection(hdcScreen, &bi, DIB_RGB_COLORS, NULL, NULL, 0);
-    g_ov.hbmBack = CreateDIBSection(hdcScreen, &bi, DIB_RGB_COLORS, NULL, NULL, 0);
-    if (!g_ov.hbmDim || !g_ov.hbmBack) {
-        ReleaseDC(NULL, hdcScreen);
-        return FALSE;
-    }
-
-    g_ov.hdcCap  = CreateCompatibleDC(hdcScreen);
-    g_ov.hdcDim  = CreateCompatibleDC(hdcScreen);
-    g_ov.hdcBack = CreateCompatibleDC(hdcScreen);
-    SelectObject(g_ov.hdcCap,  g_ov.hbmCap);
-    SelectObject(g_ov.hdcDim,  g_ov.hbmDim);
-    SelectObject(g_ov.hdcBack, g_ov.hbmBack);
 
     /* 抓屏；带 CAPTUREBLT 才能抓到分层窗口，失败则退回普通模式 */
     if (!BitBlt(g_ov.hdcCap, 0, 0, g_ov.vw, g_ov.vh,
@@ -388,34 +425,7 @@ static BOOL CaptureVirtualScreen(void)
     }
     ReleaseDC(NULL, hdcScreen);
 
-    /* 预生成变暗版（约 45% 亮度） */
-    {
-        BYTE *src = (BYTE *)g_ov.pixCap;
-        (void)src;
-        /* 直接对 dim DC 做整幅拷贝后再压暗更快：先 blit，再逐像素 */
-        BitBlt(g_ov.hdcDim, 0, 0, g_ov.vw, g_ov.vh, g_ov.hdcCap, 0, 0, SRCCOPY);
-
-        BITMAP bm;
-        if (GetObjectW(g_ov.hbmDim, sizeof(bm), &bm)) {
-            BYTE *dst = (BYTE *)bm.bmBits;
-            if (dst) {
-                size_t n = (size_t)g_ov.vw * g_ov.vh;
-                for (size_t i = 0; i < n; i++) {
-                    BYTE *p = dst + i * 4;
-                    p[0] = (BYTE)(p[0] * 45 / 100);
-                    p[1] = (BYTE)(p[1] * 45 / 100);
-                    p[2] = (BYTE)(p[2] * 45 / 100);
-                    p[3] = 255;
-                }
-            }
-        }
-        /* 原始像素的 alpha 一并归位，避免 PNG 变透明 */
-        BYTE *cap = (BYTE *)g_ov.pixCap;
-        if (cap) {
-            size_t n = (size_t)g_ov.vw * g_ov.vh;
-            for (size_t i = 0; i < n; i++) cap[i * 4 + 3] = 255;
-        }
-    }
+    OvDimBuffers();
     return TRUE;
 }
 
@@ -2437,6 +2447,136 @@ static LRESULT CALLBACK MsgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 
 /* ---------------------------------------------------------------- 自检 */
 
+/* 离屏合成一张"遮罩界面"示意图：把指定图片当截图底图，
+ * 套上选区、标注和工具条后输出 PNG。用来生成文档配图。 */
+static int RunDemoShot(const WCHAR *bgPath, const WCHAR *outPath, BOOL showAll)
+{
+    GpBitmap *bmp = NULL;
+    if (GdipCreateBitmapFromFile(bgPath, &bmp) != 0 || !bmp) {
+        printf("FAIL: load bg\n");
+        return 1;
+    }
+    UINT iw = 0, ih = 0;
+    GdipGetImageWidth((GpImage *)bmp, &iw);
+    GdipGetImageHeight((GpImage *)bmp, &ih);
+    if (!iw || !ih) { GdipDisposeImage((GpImage *)bmp); return 1; }
+
+    OverlayGdiInit();          /* 工具条底刷/画笔都靠它，漏了会画不出来 */
+
+    ZeroMemory(&g_ov, sizeof(g_ov));
+    g_ov.vx = 0; g_ov.vy = 0;
+    g_ov.vw = (int)iw;
+    g_ov.vh = (int)ih;
+
+    if (!OvAllocBuffers(g_ov.vw, g_ov.vh)) { GdipDisposeImage((GpImage *)bmp); return 1; }
+
+    /* 把图铺进"截图"缓冲 */
+    GpGraphics *gp = NULL;
+    if (GdipCreateFromHDC(g_ov.hdcCap, &gp) != 0 || !gp) {
+        GdipDisposeImage((GpImage *)bmp);
+        return 1;
+    }
+    GdipSetCompositingMode(gp, CompositingModeSourceCopy);
+    GdipSetInterpolationMode(gp, InterpolationModeHighQualityBicubic);
+    GdipDrawImageRectI(gp, (GpImage *)bmp, 0, 0, g_ov.vw, g_ov.vh);
+    GdipDeleteGraphics(gp);
+    GdipDisposeImage((GpImage *)bmp);
+
+    OvDimBuffers();
+
+    /* 界面状态：选中一块区域，工具停在椭圆 */
+    g_ov.hasSel = TRUE;
+    g_ov.state  = ST_SELECTED;
+    g_ov.sel.left  = 430;  g_ov.sel.top    = 196;
+    g_ov.sel.right = 2150; g_ov.sel.bottom = 1158;
+    g_ov.hotBtn = -1; g_ov.hotSwatch = -1; g_ov.hotSize = -1; g_ov.hotPin = FALSE;
+    g_pressBtn  = -1;
+    g_tool      = TOOL_ELLIPSE;
+    g_annColor  = g_palette[0];
+    g_sizeLevel = 1;
+
+    g_annCount = 0;
+    {
+        Annot *a = &g_ann[g_annCount++];        /* 马赛克盖手机号 */
+        ZeroMemory(a, sizeof(*a));
+        a->kind = AN_MOSAIC; a->color = g_annColor; a->width = g_penW[g_sizeLevel];
+        a->rc.left = 578; a->rc.top = 836; a->rc.right = 748; a->rc.bottom = 876;
+
+        Annot *b = &g_ann[g_annCount++];        /* 圈住合计金额 */
+        ZeroMemory(b, sizeof(*b));
+        b->kind = AN_ELLIPSE; b->color = g_annColor; b->width = g_penW[g_sizeLevel];
+        b->rc.left = 1646; b->rc.top = 644; b->rc.right = 1830; b->rc.bottom = 720;
+
+        Annot *c = &g_ann[g_annCount++];        /* 箭头指向按钮 */
+        ZeroMemory(c, sizeof(*c));
+        c->kind = AN_ARROW; c->color = g_annColor; c->width = g_penW[g_sizeLevel];
+        c->pts[0].x = 1700; c->pts[0].y = 980;
+        c->pts[1].x = 1952; c->pts[1].y = 1048;
+        c->npts = 2;
+
+        Annot *d = &g_ann[g_annCount++];        /* 文字 */
+        ZeroMemory(d, sizeof(*d));
+        d->kind = AN_TEXT; d->color = g_annColor; d->fontH = g_textH[g_sizeLevel];
+        d->x = 1690; d->y = 300;
+        lstrcpynW(d->text, L"待核对", 256);
+
+        if (showAll) {
+            Annot *e = &g_ann[g_annCount++];    /* 矩形框住一行 */
+            ZeroMemory(e, sizeof(*e));
+            e->kind = AN_RECT; e->color = g_palette[3]; e->width = g_penW[g_sizeLevel];
+            e->rc.left = 462; e->rc.top = 388; e->rc.right = 1896; e->rc.bottom = 456;
+
+            Annot *f = &g_ann[g_annCount++];    /* 画笔圈最后一行 */
+            ZeroMemory(f, sizeof(*f));
+            f->kind = AN_PEN; f->color = g_palette[2]; f->width = g_penW[g_sizeLevel];
+            for (int i = 0; i <= 74; i++) {
+                double t = i / 74.0 * 6.28318;
+                f->pts[i].x = 540 + i * 18;              /* 横向铺开 */
+                f->pts[i].y = 618 + (int)(40 * sin(t));  /* 正弦波动 */
+                f->npts++;
+            }
+
+            Annot *g2 = &g_ann[g_annCount++];   /* 序号 */
+            ZeroMemory(g2, sizeof(*g2));
+            g2->kind = AN_NUMBER; g2->color = g_palette[1];
+            g2->x = 1560; g2->y = 228; g2->fontH = g_numD[1];
+            lstrcpynW(g2->text, L"1", 256);
+        }
+    }
+
+    BITMAPINFO bi;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = g_ov.vw;
+    bi.bmiHeader.biHeight      = -g_ov.vh;
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    void *obits = NULL;
+    HDC sdc = GetDC(NULL);
+    HBITMAP out = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &obits, NULL, 0);
+    ReleaseDC(NULL, sdc);
+    if (!out || !obits) { FreeCapture(); return 1; }
+
+    HDC odc = CreateCompatibleDC(NULL);
+    HGDIOBJ old = SelectObject(odc, out);
+    OverlayDraw(odc);
+    SelectObject(odc, old);
+    DeleteDC(odc);
+
+    BYTE *pp = (BYTE *)obits;
+    size_t n = (size_t)g_ov.vw * g_ov.vh;
+    for (size_t i = 0; i < n; i++) pp[i * 4 + 3] = 255;
+
+    BOOL ok = SaveBitmapToPng(out, outPath);
+    DeleteObject(out);
+    FreeCapture();
+    OverlayGdiFree();
+    printf("demo: %s\n", ok ? "ok" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 static int RunCaptureTest(void)
 {
     WCHAR out[MAX_PATH];
@@ -2684,7 +2824,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
 
     /* 单实例（自检模式跳过，免得被正在运行的实例挡掉） */
     BOOL isTest = (wcsstr(GetCommandLineW(), L"--capture-test") != NULL ||
-                   wcsstr(GetCommandLineW(), L"--toolbar-test") != NULL);
+                   wcsstr(GetCommandLineW(), L"--toolbar-test") != NULL ||
+                   wcsstr(GetCommandLineW(), L"--demo") != NULL);
     HANDLE mutex = NULL;
     if (!isTest) {
         mutex = CreateMutexW(NULL, TRUE, L"Global\\QuickShot_SingleInstance");
@@ -2767,6 +2908,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
         }
         if (wcsstr(cl, L"--toolbar-test")) {
             int r = RunToolbarTest();
+            GdiplusShutdown(g_gdiToken);
+            return r;
+        }
+        if (wcsstr(cl, L"--demo")) {
+            int ac = 0, r = 1;
+            LPWSTR *av = CommandLineToArgvW(cl, &ac);
+            if (av && ac >= 4) r = RunDemoShot(av[2], av[3], ac >= 5);
+            if (av) LocalFree(av);
             GdiplusShutdown(g_gdiToken);
             return r;
         }
