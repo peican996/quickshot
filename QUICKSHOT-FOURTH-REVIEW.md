@@ -259,3 +259,127 @@ A8D9086C38DA2914B751F7F56CD2258C28AA09D78185781573758C201D6F28F2
 | 4 | 位图类没有 stock 兜底 | 恢复失败时只能依赖 `DeleteDC` 解除引用，已通过测试验证可行 |
 | 5 | 自检会临时改写热键注册表 | 测试前后备份还原；若测试期间用户手动改键会被还原值覆盖 |
 | 6 | `shot.c` 约 4600 行（含自检） | 按既定计划，模块化拆分放到后续阶段 |
+
+---
+
+## 8. 收尾轮（提交 `v1.1.1`）：异常释放闭环与恢复结果检查
+
+本轮只处理两项 P2，不改变任何正常功能表现。
+
+### 8.1 `GdiRelease` 异常释放路径
+
+[`shot.c#L386-L433`](file:///C:/code/quickshot/shot.c#L386-L433) 的新顺序：
+
+1. `GdiFlushDeferred()` 顺手清理之前排队、现在已能释放的对象；
+2. `GdiRestore()` 恢复原对象；
+3. 恢复失败且有 stock 替代 → 顶出临时对象，**并检查顶出是否成功**；
+4. `DeleteObject()` 并检查结果；
+5. **删除失败时不再丢句柄**：把「对象 + 所属 DC」登记进延迟队列；
+6. 返回 `restored && deleted`，异常情况一律 `FALSE`。
+
+延迟队列（[`shot.c#L289-L317`](file:///C:/code/quickshot/shot.c#L289-L317)）：
+
+```c
+#define GDI_DEFER_MAX 16
+typedef struct { HGDIOBJ obj; HDC hdc; } GdiDeferred;
+```
+
+- 所有权：登记后句柄由延迟队列持有，调用方不再负责；
+- 生命周期：`GdiFlushDeferred()` 只对「DC 已释放、对象已可删」的条目重试 `DeleteObject`，**从不主动销毁任何 DC**（符合“不允许为释放临时对象而销毁外部共享 DC”）；
+- 调用时机：`GdiRelease()` 入口、`FreeCapture()`、`MosaicCacheFree()`、`BuildFinalBitmap()`、钉图销毁/创建失败、`RunDemoShot()`、`TestSurfaceDestroy()` 等每个 `DeleteDC` 之后；
+- 队列满（16）时明确日志，不会静默丢弃。
+
+### 8.2 所有 `GdiRelease` 调用点及失败处理
+
+| 调用点 | stock 兜底 | 失败时的行为 |
+|---|---|---|
+| `DrawPenStroke` "pen stroke" | NULL_PEN | 日志 + 计数 + 必要时延迟释放；绘制已完成，不影响后续 |
+| `DrawEllipseAnnot` "ellipse pen" | NULL_PEN | 同上 |
+| `DrawRectAnnot` "rect pen" | NULL_PEN | 同上 |
+| `DrawArrowAnnot` "arrow brush" / "arrow pen" | WHITE_BRUSH / NULL_PEN | 同上；画刷未选入时直接 `DeleteObject` |
+| `DrawNumberAnnot` "number circle brush" / "number font" | WHITE_BRUSH / DEFAULT_GUI_FONT | 同上 |
+| `DrawTextAnnot` "text font" | DEFAULT_GUI_FONT | 同上 |
+| `TextAnnotRect` "measure font" | DEFAULT_GUI_FONT | 失败时仍返回测量结果（可能为 0 尺寸），字体必删 |
+| 自检 "release fallback" / "loop font" / "loop pen" / "loop pen 2" / "defer test" | 视用例 | 直接断言返回值与队列状态 |
+
+绘图函数无法“撤销”已经画出的像素，因此失败不会中断绘制流程，但会同时满足三点：写日志（含上下文与句柄）、累加 `g_gdiReleaseFailures`、必要时进入延迟队列——不会被完全忽略。自检在**正常渲染阶段**断言三个计数器必须为 0（`no gdi failures during warmup rendering`）。
+
+### 8.3 所有 `GdiRestore` 调用点及失败处理
+
+| 调用点 | 恢复对象类型 | 失败影响 | 处理 |
+|---|---|---|---|
+| `RestoreOldBmp` "capture bitmap" | 位图 | 位图仍被 DC 引用 | 清空记录，由 `DeleteDC` 解除引用后删除 |
+| `DrawEllipseAnnot` "ellipse brush" | stock NULL_BRUSH | 上一个画刷未恢复 | 日志 + 计数；后续画笔仍会正常释放 |
+| `DrawRectAnnot` "rect brush" | stock NULL_BRUSH | 同上 | 同上 |
+| `DrawArrowAnnot` "arrow null pen" | stock NULL_PEN | 同上 | 同上 |
+| `DrawNumberAnnot` "number circle null pen" | stock NULL_PEN | 同上 | 同上 |
+| `MosaicCacheFree` "mosaic cache bitmap" | 位图 | 位图仍被引用 | `DeleteDC` 后再删 |
+| `BuildFinalBitmap` "final bitmap" | 位图 | 同上 | 同上 |
+| `ToastProc` / `ToastShowAt` | 全局字体 | 提示字体未恢复 | 只影响本次绘制 DC，日志 + 计数 |
+| `DrawToolbar` "toolbar separator pen" | 全局画笔 | 分隔线 DC 状态 | 只在 `GdiSelect` 成功时恢复，失败记日志 |
+| `OverlayDraw` "selection outer/inner frame"、"selection frame brush"、"size label font" | 全局画笔/画刷/字体 | 选区装饰绘制 | **本轮修复**：尺寸标签先判断 `GdiSelect` 结果，未选入就不调用恢复（原先会无条件恢复空句柄） |
+| `CreatePinWindow` / `PinProc` | 位图 | 位图仍被引用 | `DeleteDC` 后删除 |
+| `RunDemoShot` / `RunToolbarTest` / `RenderOverlayToDib` / 自检微基准 / `TestSurfaceDestroy` | 位图 | 同上 | 同上 |
+
+其余 stock 对象恢复失败只会让 DC 停留在 stock 状态（不会泄漏句柄），因此按“日志 + 计数”升级，不阻断绘制。
+
+### 8.4 测试框架的两个修正（保证计数可信）
+
+1. **补齐全局 GDI 对象**：自检直接创建遮罩窗口，没有走 `WM_CREATE`/捕获入口的 `OverlayGdiInit`，导致工具条画笔、选框画笔、标签字体都是空句柄，每次 `OverlayDraw` 产生 4～5 次“空对象选入”。新增 `TestOverlayEnsureGdi()` 在预热和文字用例后补齐，失败计数从 3000+ 降到 4（全部来自刻意构造的非法入参）。
+2. **失败计数纳入断言**：`g_gdiSelectFailures` / `g_gdiRestoreFailures` / `g_gdiReleaseFailures` 在正常渲染阶段必须为 0。
+
+### 8.5 故障注入测试结果
+
+三个注入开关都只改返回值、不触碰 DC：
+
+| 注入 | 用途 | 实测 |
+|---|---|---|
+| `g_gdiFailInject` | 选入失败 | `text measure: injected select failure, rect 0x0, gdi 35 -> 35` |
+| `g_gdiRestoreFailInject` | 恢复失败 | `draw fail: gdi 39 -> 40 -> 40 (100 injected draws)`，像素比对 `2304 diff=0` |
+| `g_gdiDeleteFailInject` | 删除失败（模拟仍被引用） | `defer: selected=1 released=0 deferredCount=1 (base 0) objType=1` |
+
+延迟释放闭环实测：
+
+```text
+defer: selected=1 released=0 deferredCount=1 (base 0) objType=1
+[PASS] defer: release reports failure
+[PASS] defer: un-deletable object is retained
+[PASS] defer: handle still valid before DC teardown
+[PASS] defer: queue drained after DC destroyed
+[PASS] defer: deferred object finally released
+[PASS] defer: no gdi growth after deferred release
+```
+
+说明：`GetObjectType` 对“已删除但句柄尚未回收”的对象仍会返回类型，不能作为唯一判据，因此以「队列计数 + GDI 总量」作为释放证据。
+
+### 8.6 回归结果
+
+```text
+gdi after warmup: 35
+capture: 1000x 46375 ms, gdi 35 -> 35
+text: 1000x commit/cancel, gdi 41 -> 41
+gdi font loop: 1000x, gdi 37 -> 37
+gdi pen loop: 1000x, gdi 37 -> 38（首次画线的一次性缓存）
+gdi pen loop: second 1000x, gdi 38 -> 38
+=== gdi total: 35 -> 31 ===
+=== gdi failures: select=4 restore=107 release=2 deferred=0 freed=1 ===
+=== OK (0 failures) ===
+```
+
+| 命令 | 退出码 | 结果 |
+|---|---|---|
+| `--stress-test` | 0 | **90 PASS / 0 FAIL** |
+| `--capture-test` | 0 | 2560×1440、`png: ok`、热键可用 |
+| `--toolbar-test` | 0 | `out-of-bounds: 0`、`cursor mismatches: 0` |
+| `--demo` | 0 | SHA256 `A8D9086C…28F2`，与前几轮完全一致 |
+
+计数器含义：`select=4`（2 次刻意非法入参 + 2 次文字选入注入）、`restore=107`（1 次绘制注入 + 100 次循环注入 + 6 次刻意失败）、`release=2`（两个刻意失败用例），均来自自检构造，正常路径为 0。
+
+### 8.7 收尾轮新增风险
+
+| # | 风险 | 说明 |
+|---|---|---|
+| 1 | 延迟队列容量 16 | 溢出时明确日志但无法继续保留；正常路径不会进入该分支 |
+| 2 | `GetObjectType` 不能证明句柄已回收 | 改用 GDI 总量与队列计数作为判据 |
+| 3 | 注入开关存在于产品代码 | 常量恒为 0，仅自检写入；如需可编译期裁掉 |
+

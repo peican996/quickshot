@@ -271,26 +271,71 @@ static BOOL GetEncoderClsid(const WCHAR *mime, CLSID *clsid)
  * 因为 DeleteDC 本身会解除位图引用，之后再 DeleteObject 一定成功。
  */
 
-/* 供自检使用的故障注入：>0 时让下一次 GdiSelect 直接失败（不改动任何 DC 状态），
- * 用来覆盖“选入失败”的清理分支。正常运行时恒为 0。 */
-static int g_gdiFailInject = 0;
+/* 供自检使用的故障注入：>0 时让下一次对应调用直接失败（不改动任何 DC 状态），
+ * 用来覆盖各类失败分支。正常运行时恒为 0。 */
+static int g_gdiFailInject        = 0;   /* GdiSelect 失败 */
+static int g_gdiRestoreFailInject = 0;   /* GdiRestore 失败 */
+static int g_gdiDeleteFailInject  = 0;   /* GdiRelease 中 DeleteObject 失败 */
+
+/* 失败计数：正常渲染路径必须一直为 0，自检会断言这一点。
+ * 绘图函数无法“撤销”已经画出去的像素，所以失败时以「日志 + 计数」升级，
+ * 让异常真实可见，而不是被静默忽略。 */
+static int g_gdiSelectFailures;
+static int g_gdiRestoreFailures;
+static int g_gdiReleaseFailures;
+
+/* 延迟释放队列：恢复原对象失败、stock 顶出也失败时，临时对象仍被 DC 引用，
+ * 此时 DeleteObject 必然失败。不能就这样丢掉句柄——记录「对象 + 所属 DC」，
+ * 等该 DC 被 DeleteDC 之后再重试删除。队列很小，满了就明确记日志。 */
+#define GDI_DEFER_MAX 16
+typedef struct { HGDIOBJ obj; HDC hdc; } GdiDeferred;
+
+static GdiDeferred g_gdiDeferred[GDI_DEFER_MAX];
+static int          g_gdiDeferredCount;
+static int          g_gdiDeferredDone;   /* 自检统计：延迟队列里最终成功释放的数量 */
+
+/* 尝试清空延迟队列中已经可以释放的对象。
+ * 不主动销毁任何 DC：只对“DC 已销毁（对象不再被引用）”的条目重试 DeleteObject。 */
+static void GdiFlushDeferred(void)
+{
+    int i = 0;
+    while (i < g_gdiDeferredCount) {
+        HGDIOBJ obj = g_gdiDeferred[i].obj;
+        BOOL gone = (!obj || GetObjectType(obj) == 0);
+
+        if (!gone && DeleteObject(obj)) {   /* DC 已不复存在，这次能删掉了 */
+            gone = TRUE;
+            g_gdiDeferredDone++;
+            QSLog("GdiFlushDeferred: 延迟对象 obj=%p 已释放", (void *)obj);
+        }
+
+        if (gone) {
+            g_gdiDeferred[i] = g_gdiDeferred[--g_gdiDeferredCount];
+        } else {
+            i++;
+        }
+    }
+}
 
 static BOOL GdiSelect(HDC hdc, HGDIOBJ obj, HGDIOBJ *old)
 {
     if (!old) {                             /* 输出指针必须有效，否则无法记录原对象 */
         QSLog("GdiSelect: NULL old pointer");
+        g_gdiSelectFailures++;
         return FALSE;
     }
     *old = NULL;                            /* 先初始化，失败时调用方拿到的一定是 NULL */
 
     if (!hdc || !obj) {
         QSLog("GdiSelect: 无效参数 hdc=%p obj=%p", (void *)hdc, (void *)obj);
+        g_gdiSelectFailures++;
         return FALSE;
     }
 
     if (g_gdiFailInject > 0) {              /* 自检注入：只报失败，不碰 DC */
         g_gdiFailInject--;
         QSLog("GdiSelect: 注入失败 hdc=%p obj=%p", (void *)hdc, (void *)obj);
+        g_gdiSelectFailures++;
         return FALSE;
     }
 
@@ -298,6 +343,7 @@ static BOOL GdiSelect(HDC hdc, HGDIOBJ obj, HGDIOBJ *old)
     if (!o || o == (HGDIOBJ)HGDI_ERROR) {
         QSLog("GdiSelect: SelectObject FAIL hdc=%p obj=%p err=%lu",
               (void *)hdc, (void *)obj, GetLastError());
+        g_gdiSelectFailures++;
         return FALSE;
     }
     *old = o;
@@ -310,11 +356,21 @@ static BOOL GdiRestore(HDC hdc, HGDIOBJ old, const char *ctx)
 {
     if (!hdc || !old || old == (HGDIOBJ)HGDI_ERROR) {
         QSLog("GdiRestore(%s): 无效参数 hdc=%p old=%p", ctx, (void *)hdc, (void *)old);
+        g_gdiRestoreFailures++;
         return FALSE;
     }
+
+    if (g_gdiRestoreFailInject > 0) {       /* 自检注入：只报失败，不碰 DC */
+        g_gdiRestoreFailInject--;
+        QSLog("GdiRestore(%s): 注入失败 hdc=%p old=%p", ctx, (void *)hdc, (void *)old);
+        g_gdiRestoreFailures++;
+        return FALSE;
+    }
+
     HGDIOBJ o = SelectObject(hdc, old);
     if (!o || o == (HGDIOBJ)HGDI_ERROR) {
         QSLog("GdiRestore(%s): FAIL err=%lu（DC 里可能仍是临时对象）", ctx, GetLastError());
+        g_gdiRestoreFailures++;
         return FALSE;
     }
     return TRUE;
@@ -323,12 +379,15 @@ static BOOL GdiRestore(HDC hdc, HGDIOBJ old, const char *ctx)
 /* 临时对象的标准释放流程。顺序是有意这样排的：
  *   1. 先恢复原对象；
  *   2. 恢复失败说明临时对象可能仍被 DC 引用——这时直接 DeleteObject 会静默失败，
- *      所以先用同类 stock 对象把它顶出 DC（stockFallback=-1 表示无替代，如 HBITMAP，
- *      此类资源由调用方按“恢复 → DeleteDC → DeleteObject”的顺序保证安全）；
- *   3. 最后删除临时对象并检查结果，失败时把句柄值写进日志，便于定位仍有引用的 DC。
- * 返回值 TRUE 仅表示“原对象已恢复且临时对象已删除”，恢复失败一律返回 FALSE。 */
+ *      所以先用同类 stock 对象把它顶出 DC（stockFallback=-1 表示无替代，如 HBITMAP）；
+ *   3. 删除临时对象并检查结果；
+ *   4. 若顶出与删除都失败，把「对象 + 所属 DC」放进延迟队列，绝不丢失句柄，
+ *      等该 DC 销毁后由 GdiFlushDeferred() 重试释放。
+ * 返回值 TRUE 仅表示“原对象已恢复且临时对象已删除”，其余情况一律 FALSE。 */
 static BOOL GdiRelease(HDC hdc, HGDIOBJ obj, HGDIOBJ old, int stockFallback, const char *ctx)
 {
+    GdiFlushDeferred();                     /* 顺手清理之前排队、现在已能释放的对象 */
+
     BOOL restored = GdiRestore(hdc, old, ctx);
 
     if (!restored && hdc && obj && stockFallback >= 0) {
@@ -337,15 +396,33 @@ static BOOL GdiRelease(HDC hdc, HGDIOBJ obj, HGDIOBJ old, int stockFallback, con
         if (r && r != (HGDIOBJ)HGDI_ERROR)
             QSLog("GdiRelease(%s): 已用 stock 顶出 obj=%p（原对象 old=%p 仍未恢复）",
                   ctx, (void *)obj, (void *)old);
+        else
+            QSLog("GdiRelease(%s): stock 顶出失败 obj=%p（对象仍被 DC 引用）",
+                  ctx, (void *)obj);
     }
 
     BOOL deleted = TRUE;
     if (obj) {
-        deleted = DeleteObject(obj) ? TRUE : FALSE;
-        if (!deleted)
-            QSLog("GdiRelease(%s): DeleteObject FAIL obj=%p（句柄可能仍被 DC 引用）",
-                  ctx, (void *)obj);
+        if (g_gdiDeleteFailInject > 0) {   /* 自检注入：模拟对象仍被引用、删不掉 */
+            g_gdiDeleteFailInject--;
+            deleted = FALSE;
+            QSLog("GdiRelease(%s): 注入删除失败 obj=%p", ctx, (void *)obj);
+        } else {
+            deleted = DeleteObject(obj) ? TRUE : FALSE;
+        }
+        if (!deleted) {
+            QSLog("GdiRelease(%s): DeleteObject FAIL obj=%p，转入延迟释放", ctx, (void *)obj);
+            if (g_gdiDeferredCount < GDI_DEFER_MAX) {
+                g_gdiDeferred[g_gdiDeferredCount].obj = obj;
+                g_gdiDeferred[g_gdiDeferredCount].hdc = hdc;
+                g_gdiDeferredCount++;
+            } else {
+                QSLog("GdiRelease(%s): 延迟队列已满，obj=%p 无法登记", ctx, (void *)obj);
+            }
+        }
     }
+
+    if (!(restored && deleted)) g_gdiReleaseFailures++;
     return restored && deleted;
 }
 
@@ -600,6 +677,9 @@ static void FreeCapture(void)
     if (g_ov.hbmBack) { DeleteObject(g_ov.hbmBack); g_ov.hbmBack = NULL; }
     g_ov.pixCap = NULL;
 
+    /* DC 已销毁，之前因恢复失败而挂起的临时对象现在可以真正释放 */
+    GdiFlushDeferred();
+
     /* 底图没了，马赛克缓存也没意义了 */
     MosaicCacheFreeAll();
 }
@@ -731,6 +811,7 @@ static void MosaicCacheFree(MosaicCache *c)
         if (c->oldBmp) GdiRestore(c->hdc, c->oldBmp, "mosaic cache bitmap");
         DeleteDC(c->hdc);
         c->hdc = NULL;
+        GdiFlushDeferred();                 /* 缓存的 DC 已销毁，挂起对象可释放 */
     }
     c->oldBmp = NULL;
     if (c->hbm) { DeleteObject(c->hbm); c->hbm = NULL; }
@@ -980,6 +1061,7 @@ static HBITMAP BuildFinalBitmap(int x, int y, int w, int h, void **ppBits)
     /* 还原失败也不要紧：DeleteDC 会解除位图引用，随后 DeleteObject 才有效 */
     GdiRestore(dc, old, "final bitmap");
     DeleteDC(dc);
+    GdiFlushDeferred();                    /* 临时 DC 已销毁，挂起对象可释放 */
     if (!ok) {                             /* 底图都没贴成功，返回的位图没有意义 */
         DeleteObject(hbm);
         return NULL;
@@ -1193,6 +1275,13 @@ static void OverlayGdiInit(void)
     g_penSep       = CreatePen(PS_SOLID, 1, RGB(205, 205, 205));
     g_penOk        = CreatePen(PS_SOLID, 2, RGB(34, 150, 80));
     g_penNo        = CreatePen(PS_SOLID, 2, RGB(200, 60, 60));
+}
+
+/* 自检用：确保工具条/选框的全局 GDI 对象存在。
+ * 应用里由捕获入口（OverlayGdiInit）负责，自检里没有走那条路径，需要显式补齐。 */
+static void TestOverlayEnsureGdi(void)
+{
+    if (!g_penSel) OverlayGdiInit();
 }
 
 static void OverlayGdiFree(void)
@@ -1825,8 +1914,9 @@ static void OverlayDraw(HDC hdcTarget)
         WCHAR label[64];
         wsprintfW(label, L"%d × %d", SelW(), SelH());
 
+        /* 字体没建出来时用默认字体量，此时不需要（也不能）恢复 */
         HGDIOBJ oldFont = NULL;
-        GdiSelect(g_ov.hdcBack, g_fontLabel, &oldFont);   /* 字体没建出来就用默认字体量 */
+        BOOL haveFont = GdiSelect(g_ov.hdcBack, g_fontLabel, &oldFont);
         SIZE ts = {0, 0};
         GetTextExtentPoint32W(g_ov.hdcBack, label, lstrlenW(label), &ts);
 
@@ -1845,7 +1935,7 @@ static void OverlayDraw(HDC hdcTarget)
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SetTextColor(g_ov.hdcBack, oldTc);
         SetBkMode(g_ov.hdcBack, oldBk);
-        GdiRestore(g_ov.hdcBack, oldFont, "size label font");
+        if (haveFont) GdiRestore(g_ov.hdcBack, oldFont, "size label font");
 
         /* 松手之后才显示手柄和工具条 */
         if (g_ov.state != ST_NEW) {
@@ -2217,6 +2307,7 @@ static LRESULT CALLBACK PinProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
                 /* 先选回原位图；即使还原失败，DeleteDC 也会解除引用，位图仍可删除 */
                 if (pd->oldBmp) GdiRestore(pd->hdc, pd->oldBmp, "pin window bitmap");
                 DeleteDC(pd->hdc);
+                GdiFlushDeferred();        /* 钉图 DC 已销毁，挂起对象可释放 */
             }
             if (pd->hbm) DeleteObject(pd->hbm);
             free(pd);
@@ -2242,6 +2333,7 @@ static void CreatePinWindow(HBITMAP hbm, void *bits, int w, int h, int x, int y)
     HGDIOBJ oldBmp = NULL;
     if (!GdiSelect(pd->hdc, hbm, &oldBmp)) {
         DeleteDC(pd->hdc);
+        GdiFlushDeferred();
         DeleteObject(hbm);
         free(pd);
         return;
@@ -2255,6 +2347,7 @@ static void CreatePinWindow(HBITMAP hbm, void *bits, int w, int h, int x, int y)
     if (!hw) {
         GdiRestore(pd->hdc, pd->oldBmp, "pin create restore");
         DeleteDC(pd->hdc);
+        GdiFlushDeferred();
         DeleteObject(pd->hbm);
         free(pd);
         return;
@@ -3128,6 +3221,7 @@ static int RunDemoShot(const WCHAR *bgPath, const WCHAR *outPath, BOOL showAll)
     OverlayDraw(odc);
     GdiRestore(odc, old, "demo output bitmap");
     DeleteDC(odc);
+    GdiFlushDeferred();
 
     BYTE *pp = (BYTE *)obits;
     size_t n = (size_t)g_ov.vw * g_ov.vh;
@@ -3678,7 +3772,10 @@ typedef struct { HDC dc; HBITMAP hbm; HGDIOBJ old; void *bits; } TestSurface;
 static void TestSurfaceDestroy(TestSurface *s)
 {
     if (s->dc && s->old) GdiRestore(s->dc, s->old, "test surface bitmap");
-    if (s->dc)  DeleteDC(s->dc);
+    if (s->dc) {
+        DeleteDC(s->dc);
+        GdiFlushDeferred();         /* DC 已销毁，挂起对象可释放 */
+    }
     if (s->hbm) DeleteObject(s->hbm);
     ZeroMemory(s, sizeof(*s));
 }
@@ -4416,6 +4513,113 @@ static void TestTextAnnotSelectFailure(void)
     }
 }
 
+/* 恢复失败 + stock 顶出失败：临时对象不能丢，必须进延迟队列，DC 销毁后释放 */
+static void TestGdiDeferredRelease(void)
+{
+    TestSurface s;
+    if (!TestSurfaceCreate(&s, 16, 16)) { TestCheck(FALSE, "defer: surface"); return; }
+
+    DWORD g0 = GdiCount();
+    int  d0 = g_gdiDeferredCount;
+    int  done0 = g_gdiDeferredDone;
+
+    HPEN pen  = CreatePen(PS_SOLID, 1, RGB(9, 9, 9));
+    HPEN dead = CreatePen(PS_SOLID, 1, RGB(1, 1, 1));
+    if (!pen || !dead) {
+        if (pen)  DeleteObject(pen);
+        if (dead) DeleteObject(dead);
+        TestSurfaceDestroy(&s);
+        TestCheck(FALSE, "defer: create pens");
+        return;
+    }
+    DeleteObject(dead);                        /* 失效句柄冒充“原对象” */
+
+    HGDIOBJ oldPen = NULL;
+    BOOL selected = GdiSelect(s.dc, pen, &oldPen);
+
+    /* stockFallback = -1：没有替代对象；再注入删除失败——
+     * 模拟“对象仍被 DC 引用、DeleteObject 失败”，此时句柄必须保留 */
+    g_gdiDeleteFailInject = 1;
+    BOOL rel = GdiRelease(s.dc, pen, dead, -1, "defer test");
+    g_gdiDeleteFailInject = 0;
+
+    printf("defer: selected=%d released=%d deferredCount=%d (base %d) objType=%lu\n",
+           selected, rel, g_gdiDeferredCount, d0,
+           (unsigned long)GetObjectType(pen));
+
+    TestCheck(selected && !rel, "defer: release reports failure");
+    TestCheck(g_gdiDeferredCount == d0 + 1, "defer: un-deletable object is retained");
+    TestCheck(GetObjectType(pen) != 0, "defer: handle still valid before DC teardown");
+
+    /* DC 销毁后重试：对象应被真正释放 */
+    TestSurfaceDestroy(&s);
+    TestCheck(g_gdiDeferredCount == d0, "defer: queue drained after DC destroyed");
+    TestCheck(g_gdiDeferredDone == done0 + 1, "defer: deferred object finally released");
+    /* GetObjectType 对“已删除但句柄尚未回收”的对象仍返回类型，不能作为唯一判据；
+     * 这里用 GDI 计数确认没有残留 */
+    TestCheck(GdiCount() <= g0, "defer: no gdi growth after deferred release");
+}
+
+/* 绘制过程中恢复失败：不能影响后续绘制的 DC 状态 */
+static void TestGdiRestoreFailureDrawing(void)
+{
+    TestSurface a, b;
+    if (!TestSurfaceCreate(&a, 48, 48)) { TestCheck(FALSE, "draw fail: surface a"); return; }
+    if (!TestSurfaceCreate(&b, 48, 48)) {
+        TestSurfaceDestroy(&a);
+        TestCheck(FALSE, "draw fail: surface b");
+        return;
+    }
+
+    RECT full = { 0, 0, 48, 48 };
+    HBRUSH white = CreateSolidBrush(RGB(255, 255, 255));
+    if (white) {
+        FillRect(a.dc, &full, white);
+        FillRect(b.dc, &full, white);
+        DeleteObject(white);
+    }
+
+    Annot an;
+    ZeroMemory(&an, sizeof(an));
+    an.kind  = AN_RECT;
+    an.width = 2;
+    an.color = RGB(200, 30, 30);
+    an.rc.left = 8; an.rc.top = 8;
+    an.rc.right = 40; an.rc.bottom = 40;
+
+    DWORD g0 = GdiCount();
+    g_gdiRestoreFailInject = 1;            /* 只让第一次恢复失败（画刷恢复） */
+    DrawRectAnnot(a.dc, &an);
+    g_gdiRestoreFailInject = 0;
+
+    /* 反复注入失败：稳态下 GDI 数量必须不再增长（排除一次性的 DC 内部缓存） */
+    DWORD g1 = GdiCount();
+    for (int i = 0; i < 100; i++) {
+        g_gdiRestoreFailInject = 1;
+        DrawRectAnnot(a.dc, &an);
+        g_gdiRestoreFailInject = 0;
+    }
+    DWORD g2 = GdiCount();
+    printf("draw fail: gdi %lu -> %lu -> %lu (100 injected draws)\n", g0, g1, g2);
+    TestCheck(g2 <= g1, "draw fail: repeated restore failures do not grow gdi");
+
+    /* 恢复失败之后继续画，结果必须和“从未失败”的参照图完全一致 */
+    DrawRectAnnot(a.dc, &an);
+    DrawRectAnnot(b.dc, &an);
+
+    size_t diff = 0;
+    for (int y = 0; y < 48; y++) {
+        for (int x = 0; x < 48; x++) {
+            if (TopDownPixel(a.bits, 48, x, y) != TopDownPixel(b.bits, 48, x, y)) diff++;
+        }
+    }
+    printf("draw fail: pixels compared=2304 diff=%llu\n", (unsigned long long)diff);
+    TestCheck(diff == 0, "draw fail: dc state intact after failed restore");
+
+    TestSurfaceDestroy(&a);
+    TestSurfaceDestroy(&b);
+}
+
 /* RestoreOldBmp：正常释放路径 + 原对象句柄失效时的清理路径 */
 static void TestRestoreOldBmp(void)
 {
@@ -4465,6 +4669,8 @@ static void WarmUpAll(HWND overlay)
     g_ov.hwnd = overlay;
     g_ov.vx = 0; g_ov.vy = 0;
     g_ov.vw = 640; g_ov.vh = 480;
+    /* 自检里没有走 WM_CREATE 的初始化路径，这里补齐工具条/选框需要的全局对象 */
+    TestOverlayEnsureGdi();
     g_ov.hasSel = TRUE;
     g_ov.state = ST_SELECTED;
     g_ov.sel.left = 10;  g_ov.sel.top = 10;
@@ -4518,12 +4724,18 @@ static int RunStabilityTest(void)
      * 第二遍之后基线才稳定，避免把一次性缓存误判成泄漏 */
     WarmUpAll(overlay);
     WarmUpAll(overlay);
+    TestOverlayEnsureGdi();                /* 预热结尾释放过全局对象，正式测试前重建 */
     DWORD g0 = GdiCount();
     printf("  gdi after warmup: %lu\n", g0);
+    /* 正常渲染路径不允许出现任何 GDI 失败（注入测试在更后面才执行） */
+    TestCheck(g_gdiSelectFailures == 0 && g_gdiRestoreFailures == 0 &&
+              g_gdiReleaseFailures == 0,
+              "no gdi failures during warmup rendering");
 
     TestCaptureLoop();
     printf("  gdi after capture: %lu\n", GdiCount());
     TestTextLifecycle(overlay);
+    TestOverlayEnsureGdi();                /* 上一步收尾时释放过全局对象 */
     printf("  gdi after text: %lu\n", GdiCount());
     TestMosaic(overlay);
     printf("  gdi after mosaic: %lu\n", GdiCount());
@@ -4537,6 +4749,8 @@ static int RunStabilityTest(void)
     TestHotkeyAllOccupied();
     TestGdiLifecycle();
     TestTextAnnotSelectFailure();
+    TestGdiDeferredRelease();
+    TestGdiRestoreFailureDrawing();
     TestRestoreOldBmp();
 
     /* 模拟一次正常退出：窗口销毁 + 资源统一释放 */
@@ -4549,6 +4763,11 @@ static int RunStabilityTest(void)
     DWORD g1 = GdiCount();
     printf("=== gdi total: %lu -> %lu ===\n", g0, g1);
     TestCheck(g1 <= g0, "no gdi leak across whole run");
+
+    printf("=== gdi failures: select=%d restore=%d release=%d deferred=%d freed=%d ===\n",
+           g_gdiSelectFailures, g_gdiRestoreFailures, g_gdiReleaseFailures,
+           g_gdiDeferredCount, g_gdiDeferredDone);
+    TestCheck(g_gdiDeferredCount == 0, "no pending deferred gdi objects at exit");
 
     printf("=== %s (%d failures) ===\n", g_testFail ? "FAILED" : "OK", g_testFail);
     fflush(stdout);
