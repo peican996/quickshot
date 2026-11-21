@@ -258,6 +258,97 @@ static BOOL GetEncoderClsid(const WCHAR *mime, CLSID *clsid)
     return ok;
 }
 
+/* ---------------------------------------------------------------- GDI 对象生命周期 */
+
+/* 统一的选取/恢复入口，避免每个绘制函数各写一套容易出错的清理代码。
+ *
+ * 生命周期约定：
+ *   1. 临时对象创建成功后，用 GdiSelect 选入 DC，同时拿到原对象；
+ *   2. 绘制只发生在 GdiSelect 成功之后；
+ *   3. 结束后用 GdiRelease 一步完成“恢复原对象 + 删除临时对象”，
+ *      恢复失败时先用同类 stock 对象把临时对象顶出 DC，保证 DeleteObject 不会静默失败。
+ * 位图/DC 这类没有 stock 替代对象的资源，选入时用 GdiSelect、销毁前用 GdiRestore 恢复，
+ * 因为 DeleteDC 本身会解除位图引用，之后再 DeleteObject 一定成功。
+ */
+
+/* 供自检使用的故障注入：>0 时让下一次 GdiSelect 直接失败（不改动任何 DC 状态），
+ * 用来覆盖“选入失败”的清理分支。正常运行时恒为 0。 */
+static int g_gdiFailInject = 0;
+
+static BOOL GdiSelect(HDC hdc, HGDIOBJ obj, HGDIOBJ *old)
+{
+    if (!old) {                             /* 输出指针必须有效，否则无法记录原对象 */
+        QSLog("GdiSelect: NULL old pointer");
+        return FALSE;
+    }
+    *old = NULL;                            /* 先初始化，失败时调用方拿到的一定是 NULL */
+
+    if (!hdc || !obj) {
+        QSLog("GdiSelect: 无效参数 hdc=%p obj=%p", (void *)hdc, (void *)obj);
+        return FALSE;
+    }
+
+    if (g_gdiFailInject > 0) {              /* 自检注入：只报失败，不碰 DC */
+        g_gdiFailInject--;
+        QSLog("GdiSelect: 注入失败 hdc=%p obj=%p", (void *)hdc, (void *)obj);
+        return FALSE;
+    }
+
+    HGDIOBJ o = SelectObject(hdc, obj);
+    if (!o || o == (HGDIOBJ)HGDI_ERROR) {
+        QSLog("GdiSelect: SelectObject FAIL hdc=%p obj=%p err=%lu",
+              (void *)hdc, (void *)obj, GetLastError());
+        return FALSE;
+    }
+    *old = o;
+    return TRUE;
+}
+
+/* 把选入前的原对象换回去。失败会写日志并返回 FALSE：
+ * 此时 DC 里仍然是临时对象，调用方不能直接删它（用 GdiRelease 处理这种场景）。 */
+static BOOL GdiRestore(HDC hdc, HGDIOBJ old, const char *ctx)
+{
+    if (!hdc || !old || old == (HGDIOBJ)HGDI_ERROR) {
+        QSLog("GdiRestore(%s): 无效参数 hdc=%p old=%p", ctx, (void *)hdc, (void *)old);
+        return FALSE;
+    }
+    HGDIOBJ o = SelectObject(hdc, old);
+    if (!o || o == (HGDIOBJ)HGDI_ERROR) {
+        QSLog("GdiRestore(%s): FAIL err=%lu（DC 里可能仍是临时对象）", ctx, GetLastError());
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* 临时对象的标准释放流程。顺序是有意这样排的：
+ *   1. 先恢复原对象；
+ *   2. 恢复失败说明临时对象可能仍被 DC 引用——这时直接 DeleteObject 会静默失败，
+ *      所以先用同类 stock 对象把它顶出 DC（stockFallback=-1 表示无替代，如 HBITMAP，
+ *      此类资源由调用方按“恢复 → DeleteDC → DeleteObject”的顺序保证安全）；
+ *   3. 最后删除临时对象并检查结果，失败时把句柄值写进日志，便于定位仍有引用的 DC。
+ * 返回值 TRUE 仅表示“原对象已恢复且临时对象已删除”，恢复失败一律返回 FALSE。 */
+static BOOL GdiRelease(HDC hdc, HGDIOBJ obj, HGDIOBJ old, int stockFallback, const char *ctx)
+{
+    BOOL restored = GdiRestore(hdc, old, ctx);
+
+    if (!restored && hdc && obj && stockFallback >= 0) {
+        HGDIOBJ s = GetStockObject(stockFallback);
+        HGDIOBJ r = s ? SelectObject(hdc, s) : NULL;
+        if (r && r != (HGDIOBJ)HGDI_ERROR)
+            QSLog("GdiRelease(%s): 已用 stock 顶出 obj=%p（原对象 old=%p 仍未恢复）",
+                  ctx, (void *)obj, (void *)old);
+    }
+
+    BOOL deleted = TRUE;
+    if (obj) {
+        deleted = DeleteObject(obj) ? TRUE : FALSE;
+        if (!deleted)
+            QSLog("GdiRelease(%s): DeleteObject FAIL obj=%p（句柄可能仍被 DC 引用）",
+                  ctx, (void *)obj);
+    }
+    return restored && deleted;
+}
+
 /* ---------------------------------------------------------------- 配置 */
 
 static void LoadSettings(void)
@@ -346,10 +437,11 @@ static void ResolveSaveDir(void)
 static void FreeCapture(void);
 static void MosaicCacheFreeAll(void);
 
-/* 从 DC 上摘下我们自己选进去的位图。只有 SelectObject 成功过的才需要还原。 */
+/* 从 DC 上摘下我们自己选进去的位图。只有 SelectObject 成功过的才需要还原；
+ * 就算还原失败，后面的 DeleteDC 也会解除位图引用，DeleteObject 仍能成功。 */
 static void RestoreOldBmp(HDC dc, HGDIOBJ *old)
 {
-    if (dc && *old && *old != (HGDIOBJ)HGDI_ERROR) SelectObject(dc, *old);
+    if (dc && *old) GdiRestore(dc, *old, "capture bitmap");
     *old = NULL;
 }
 
@@ -382,12 +474,12 @@ static BOOL OvAllocBuffers(int w, int h)
     g_ov.hdcBack = CreateCompatibleDC(hdcScreen);
     if (!g_ov.hdcCap || !g_ov.hdcDim || !g_ov.hdcBack) goto done;
 
-    g_ov.oldBmpCap  = SelectObject(g_ov.hdcCap,  g_ov.hbmCap);
-    if (!g_ov.oldBmpCap || g_ov.oldBmpCap == (HGDIOBJ)HGDI_ERROR) goto done;
-    g_ov.oldBmpDim  = SelectObject(g_ov.hdcDim,  g_ov.hbmDim);
-    if (!g_ov.oldBmpDim || g_ov.oldBmpDim == (HGDIOBJ)HGDI_ERROR) goto done;
-    g_ov.oldBmpBack = SelectObject(g_ov.hdcBack, g_ov.hbmBack);
-    if (!g_ov.oldBmpBack || g_ov.oldBmpBack == (HGDIOBJ)HGDI_ERROR) goto done;
+    g_ov.oldBmpCap  = NULL;
+    g_ov.oldBmpDim  = NULL;
+    g_ov.oldBmpBack = NULL;
+    if (!GdiSelect(g_ov.hdcCap, g_ov.hbmCap, &g_ov.oldBmpCap)) goto done;
+    if (!GdiSelect(g_ov.hdcDim, g_ov.hbmDim, &g_ov.oldBmpDim)) goto done;
+    if (!GdiSelect(g_ov.hdcBack, g_ov.hbmBack, &g_ov.oldBmpBack)) goto done;
 
     ok = TRUE;
 
@@ -514,25 +606,6 @@ static void FreeCapture(void)
 
 /* ---------------------------------------------------------------- 读像素 / 输出 */
 
-/* 把 GDI 对象选进 DC 并记录原对象。
- * 返回 FALSE 表示对象没建出来或选入失败——调用方必须放弃这次绘制，
- * 绝不能继续用当前 DC 画（否则会画在错误的画笔/颜色上），
- * 交给调用方负责删除刚创建的对象。 */
-static BOOL GdiSelect(HDC hdc, HGDIOBJ obj, HGDIOBJ *old)
-{
-    if (!hdc || !obj) return FALSE;
-    HGDIOBJ o = SelectObject(hdc, obj);
-    if (!o || o == (HGDIOBJ)HGDI_ERROR) return FALSE;
-    *old = o;
-    return TRUE;
-}
-
-/* 用完把原对象换回去；old 一定是我们自己选进去时拿到的有效句柄 */
-static void GdiRestore(HDC hdc, HGDIOBJ old)
-{
-    if (hdc && old && old != (HGDIOBJ)HGDI_ERROR) SelectObject(hdc, old);
-}
-
 static void DrawPenStroke(HDC hdc, const Annot *a)
 {
     if (a->npts < 2) return;
@@ -540,8 +613,7 @@ static void DrawPenStroke(HDC hdc, const Annot *a)
     HGDIOBJ old = NULL;
     if (!GdiSelect(hdc, pen, &old)) { if (pen) DeleteObject(pen); return; }
     Polyline(hdc, a->pts, a->npts);
-    GdiRestore(hdc, old);
-    DeleteObject(pen);
+    GdiRelease(hdc, pen, old, NULL_PEN, "pen stroke");
 }
 
 static void DrawEllipseAnnot(HDC hdc, const Annot *a)
@@ -552,10 +624,9 @@ static void DrawEllipseAnnot(HDC hdc, const Annot *a)
 
     if (GdiSelect(hdc, GetStockObject(NULL_BRUSH), &oldBr)) {
         Ellipse(hdc, a->rc.left, a->rc.top, a->rc.right, a->rc.bottom);
-        GdiRestore(hdc, oldBr);
+        GdiRestore(hdc, oldBr, "ellipse brush");
     }
-    GdiRestore(hdc, oldPen);
-    DeleteObject(pen);
+    GdiRelease(hdc, pen, oldPen, NULL_PEN, "ellipse pen");
 }
 
 static void DrawRectAnnot(HDC hdc, const Annot *a)
@@ -566,10 +637,9 @@ static void DrawRectAnnot(HDC hdc, const Annot *a)
 
     if (GdiSelect(hdc, GetStockObject(NULL_BRUSH), &oldBr)) {
         Rectangle(hdc, a->rc.left, a->rc.top, a->rc.right, a->rc.bottom);
-        GdiRestore(hdc, oldBr);
+        GdiRestore(hdc, oldBr, "rect brush");
     }
-    GdiRestore(hdc, oldPen);
-    DeleteObject(pen);
+    GdiRelease(hdc, pen, oldPen, NULL_PEN, "rect pen");
 }
 
 static void DrawArrowAnnot(HDC hdc, const Annot *a)
@@ -603,14 +673,14 @@ static void DrawArrowAnnot(HDC hdc, const Annot *a)
     if (GdiSelect(hdc, br, &oldBr)) {
         if (GdiSelect(hdc, GetStockObject(NULL_PEN), &oldNullPen)) {
             Polygon(hdc, head, 3);
-            GdiRestore(hdc, oldNullPen);
+            GdiRestore(hdc, oldNullPen, "arrow null pen");
         }
-        GdiRestore(hdc, oldBr);
+        GdiRelease(hdc, br, oldBr, WHITE_BRUSH, "arrow brush");
+    } else if (br) {
+        DeleteObject(br);                  /* 没选入 DC，直接删 */
     }
-    if (br) DeleteObject(br);
 
-    GdiRestore(hdc, oldPen);
-    DeleteObject(pen);
+    GdiRelease(hdc, pen, oldPen, NULL_PEN, "arrow pen");
 }
 
 /* 马赛克：把目标区域切块、逐块取平均色涂平。
@@ -658,7 +728,7 @@ static void MosaicCacheFree(MosaicCache *c)
         g_mosaicCachedPixels = (g_mosaicCachedPixels >= px) ? g_mosaicCachedPixels - px : 0;
     }
     if (c->hdc) {
-        if (c->oldBmp && c->oldBmp != (HGDIOBJ)HGDI_ERROR) SelectObject(c->hdc, c->oldBmp);
+        if (c->oldBmp) GdiRestore(c->hdc, c->oldBmp, "mosaic cache bitmap");
         DeleteDC(c->hdc);
         c->hdc = NULL;
     }
@@ -707,8 +777,8 @@ static BOOL MosaicEnsure(MosaicCache *c, int w, int h)
     c->hdc = CreateCompatibleDC(NULL);
     if (!c->hdc) { MosaicCacheFree(c); return FALSE; }
 
-    c->oldBmp = SelectObject(c->hdc, c->hbm);
-    if (!c->oldBmp || c->oldBmp == (HGDIOBJ)HGDI_ERROR) { MosaicCacheFree(c); return FALSE; }
+    c->oldBmp = NULL;
+    if (!GdiSelect(c->hdc, c->hbm, &c->oldBmp)) { MosaicCacheFree(c); return FALSE; }
 
     c->capW = w;
     c->capH = h;
@@ -800,11 +870,12 @@ static void DrawNumberAnnot(HDC hdc, const Annot *a)
     if (GdiSelect(hdc, br, &oldBr)) {
         if (GdiSelect(hdc, GetStockObject(NULL_PEN), &oldPen)) {
             Ellipse(hdc, r.left, r.top, r.right, r.bottom);
-            GdiRestore(hdc, oldPen);
+            GdiRestore(hdc, oldPen, "number circle null pen");
         }
-        GdiRestore(hdc, oldBr);
+        GdiRelease(hdc, br, oldBr, WHITE_BRUSH, "number circle brush");
+    } else if (br) {
+        DeleteObject(br);
     }
-    if (br) DeleteObject(br);
 
     HFONT f = CreateFontW(-(int)(d * 0.58), 0, 0, 0, FW_BOLD, 0, 0, 0,
                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -818,9 +889,10 @@ static void DrawNumberAnnot(HDC hdc, const Annot *a)
         DrawTextW(hdc, a->text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SetTextColor(hdc, oldTc);
         SetBkMode(hdc, oldBk);
-        GdiRestore(hdc, oldF);
+        GdiRelease(hdc, f, oldF, DEFAULT_GUI_FONT, "number font");
+    } else {
+        DeleteObject(f);
     }
-    DeleteObject(f);
 }
 
 static void DrawTextAnnot(HDC hdc, const Annot *a)
@@ -839,9 +911,10 @@ static void DrawTextAnnot(HDC hdc, const Annot *a)
         DrawTextW(hdc, a->text, -1, &r, DT_LEFT | DT_TOP | DT_NOCLIP | DT_SINGLELINE);
         SetTextColor(hdc, oldTc);
         SetBkMode(hdc, oldBk);
-        GdiRestore(hdc, oldF);
+        GdiRelease(hdc, f, oldF, DEFAULT_GUI_FONT, "text font");
+    } else {
+        DeleteObject(f);
     }
-    DeleteObject(f);
 }
 
 /* 全部标注画到 hdc，坐标就是遮罩客户端坐标 */
@@ -888,8 +961,8 @@ static HBITMAP BuildFinalBitmap(int x, int y, int w, int h, void **ppBits)
     HDC dc = CreateCompatibleDC(NULL);
     if (!dc) { DeleteObject(hbm); return NULL; }
 
-    HGDIOBJ old = SelectObject(dc, hbm);
-    if (!old || old == (HGDIOBJ)HGDI_ERROR) {
+    HGDIOBJ old = NULL;
+    if (!GdiSelect(dc, hbm, &old)) {
         DeleteDC(dc);
         DeleteObject(hbm);
         return NULL;
@@ -904,7 +977,8 @@ static HBITMAP BuildFinalBitmap(int x, int y, int w, int h, void **ppBits)
         SetViewportOrgEx(dc, 0, 0, NULL);
     }
 
-    SelectObject(dc, old);
+    /* 还原失败也不要紧：DeleteDC 会解除位图引用，随后 DeleteObject 才有效 */
+    GdiRestore(dc, old, "final bitmap");
     DeleteDC(dc);
     if (!ok) {                             /* 底图都没贴成功，返回的位图没有意义 */
         DeleteObject(hbm);
@@ -1034,9 +1108,14 @@ static LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         }
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(238, 238, 238));
-        HGDIOBJ oldF = SelectObject(dc, g_fontToast);
-        DrawTextW(dc, g_toastText, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        SelectObject(dc, oldF);
+        HGDIOBJ oldF = NULL;
+        if (GdiSelect(dc, g_fontToast, &oldF)) {
+            DrawTextW(dc, g_toastText, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            GdiRestore(dc, oldF, "toast font");
+        } else {
+            /* 字体没建出来就用系统默认字体画，别让提示变成空白 */
+            DrawTextW(dc, g_toastText, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
         EndPaint(h, &ps);
         return 0;
     }
@@ -1060,9 +1139,11 @@ static void ToastShowAt(const WCHAR *text, int sx, int sy)
     HDC dc = GetDC(NULL);
     SIZE sz = {0, 0};
     if (dc) {
-        HGDIOBJ oldF = SelectObject(dc, g_fontToast);
-        GetTextExtentPoint32W(dc, g_toastText, lstrlenW(g_toastText), &sz);
-        SelectObject(dc, oldF);
+        HGDIOBJ oldF = NULL;
+        if (GdiSelect(dc, g_fontToast, &oldF)) {
+            GetTextExtentPoint32W(dc, g_toastText, lstrlenW(g_toastText), &sz);
+            GdiRestore(dc, oldF, "toast measure font");
+        }
         ReleaseDC(NULL, dc);
     }
 
@@ -1683,7 +1764,7 @@ static void DrawToolbar(HDC hdc)
         LineTo(hdc, s1, t.bottom - 5);
         MoveToEx(hdc, s2, ry + 5, NULL);
         LineTo(hdc, s2, t.bottom - 5);
-        GdiRestore(hdc, oldPen);
+        GdiRestore(hdc, oldPen, "toolbar separator pen");
     }
 
     /* 底色元素先画完，再统一上矢量图标，避免 GDI / GDI+ 混用 */
@@ -1732,13 +1813,13 @@ static void OverlayDraw(HDC hdcTarget)
         BOOL haveBr = GdiSelect(g_ov.hdcBack, GetStockObject(NULL_BRUSH), &oldBr);
         if (haveBr && GdiSelect(g_ov.hdcBack, g_penOuter, &oldPen)) {
             Rectangle(g_ov.hdcBack, s.left - 1, s.top - 1, s.right + 1, s.bottom + 1);
-            GdiRestore(g_ov.hdcBack, oldPen);
+            GdiRestore(g_ov.hdcBack, oldPen, "selection outer frame");
         }
         if (haveBr && GdiSelect(g_ov.hdcBack, g_penSel, &oldPen)) {
             Rectangle(g_ov.hdcBack, s.left, s.top, s.right, s.bottom);
-            GdiRestore(g_ov.hdcBack, oldPen);
+            GdiRestore(g_ov.hdcBack, oldPen, "selection inner frame");
         }
-        GdiRestore(g_ov.hdcBack, oldBr);
+        GdiRestore(g_ov.hdcBack, oldBr, "selection frame brush");
 
         /* 尺寸标签：贴选区左上角外侧，放不下就挪进去 */
         WCHAR label[64];
@@ -1764,7 +1845,7 @@ static void OverlayDraw(HDC hdcTarget)
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SetTextColor(g_ov.hdcBack, oldTc);
         SetBkMode(g_ov.hdcBack, oldBk);
-        GdiRestore(g_ov.hdcBack, oldFont);
+        GdiRestore(g_ov.hdcBack, oldFont, "size label font");
 
         /* 松手之后才显示手柄和工具条 */
         if (g_ov.state != ST_NEW) {
@@ -1877,10 +1958,13 @@ static void TextAnnotRect(const Annot *a, RECT *out)
                               CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
                               L"Microsoft YaHei UI");
         if (f) {
-            HGDIOBJ of = SelectObject(dc, f);
-            GetTextExtentPoint32W(dc, a->text, lstrlenW(a->text), &s);
-            SelectObject(dc, of);
-            DeleteObject(f);
+            HGDIOBJ of = NULL;
+            if (GdiSelect(dc, f, &of)) {
+                GetTextExtentPoint32W(dc, a->text, lstrlenW(a->text), &s);
+                GdiRelease(dc, f, of, DEFAULT_GUI_FONT, "measure font");
+            } else {
+                DeleteObject(f);
+            }
         }
         ReleaseDC(NULL, dc);
     }
@@ -2130,7 +2214,8 @@ static LRESULT CALLBACK PinProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         if (pd) {
             if (pd->hdc) {
-                if (pd->oldBmp) SelectObject(pd->hdc, pd->oldBmp);  /* 先选回去，否则位图删不掉 */
+                /* 先选回原位图；即使还原失败，DeleteDC 也会解除引用，位图仍可删除 */
+                if (pd->oldBmp) GdiRestore(pd->hdc, pd->oldBmp, "pin window bitmap");
                 DeleteDC(pd->hdc);
             }
             if (pd->hbm) DeleteObject(pd->hbm);
@@ -2153,21 +2238,22 @@ static void CreatePinWindow(HBITMAP hbm, void *bits, int w, int h, int x, int y)
     pd->h    = h;
     pd->hdc = CreateCompatibleDC(NULL);
     if (!pd->hdc) { DeleteObject(hbm); free(pd); return; }
-    pd->oldBmp = (HBITMAP)SelectObject(pd->hdc, hbm);
-    if (!pd->oldBmp || pd->oldBmp == (HBITMAP)HGDI_ERROR) {
-        pd->oldBmp = NULL;
+
+    HGDIOBJ oldBmp = NULL;
+    if (!GdiSelect(pd->hdc, hbm, &oldBmp)) {
         DeleteDC(pd->hdc);
         DeleteObject(hbm);
         free(pd);
         return;
     }
+    pd->oldBmp = (HBITMAP)oldBmp;
 
     HWND hw = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         PIN_CLASS, L"", WS_POPUP,
         x, y, w, h, NULL, NULL, g_hInst, pd);
     if (!hw) {
-        SelectObject(pd->hdc, pd->oldBmp);     /* 先选回原位图，位图才能删掉 */
+        GdiRestore(pd->hdc, pd->oldBmp, "pin create restore");
         DeleteDC(pd->hdc);
         DeleteObject(pd->hbm);
         free(pd);
@@ -3031,8 +3117,8 @@ static int RunDemoShot(const WCHAR *bgPath, const WCHAR *outPath, BOOL showAll)
 
     HDC odc = CreateCompatibleDC(NULL);
     if (!odc) { DeleteObject(out); FreeCapture(); OverlayGdiFree(); return 1; }
-    HGDIOBJ old = SelectObject(odc, out);
-    if (!old || old == (HGDIOBJ)HGDI_ERROR) {
+    HGDIOBJ old = NULL;
+    if (!GdiSelect(odc, out, &old)) {
         DeleteDC(odc);
         DeleteObject(out);
         FreeCapture();
@@ -3040,7 +3126,7 @@ static int RunDemoShot(const WCHAR *bgPath, const WCHAR *outPath, BOOL showAll)
         return 1;
     }
     OverlayDraw(odc);
-    SelectObject(odc, old);
+    GdiRestore(odc, old, "demo output bitmap");
     DeleteDC(odc);
 
     BYTE *pp = (BYTE *)obits;
@@ -3259,7 +3345,14 @@ static int RunToolbarTest(void)
     if (!hbm) { printf("FAIL: dib\n"); OverlayGdiFree(); return 1; }
 
     HDC dc = CreateCompatibleDC(NULL);
-    HGDIOBJ old = SelectObject(dc, hbm);
+    HGDIOBJ old = NULL;
+    if (!dc || !GdiSelect(dc, hbm, &old)) {
+        if (dc) DeleteDC(dc);
+        DeleteObject(hbm);
+        OverlayGdiFree();
+        printf("FAIL: dc\n");
+        return 1;
+    }
 
     RECT full = { 0, 0, w, h };
     FillRect(dc, &full, (HBRUSH)GetStockObject(GRAY_BRUSH));
@@ -3268,7 +3361,7 @@ static int RunToolbarTest(void)
     DrawToolbar(dc);
     SetViewportOrgEx(dc, 0, 0, NULL);
 
-    SelectObject(dc, old);
+    GdiRestore(dc, old, "toolbar test bitmap");
     DeleteDC(dc);
 
     WCHAR out[MAX_PATH];
@@ -3332,14 +3425,14 @@ static HBITMAP RenderOverlayToDib(void **ppBits)
     HDC dc = CreateCompatibleDC(NULL);
     if (!dc) { DeleteObject(hbm); return NULL; }
 
-    HGDIOBJ old = SelectObject(dc, hbm);
-    if (!old || old == (HGDIOBJ)HGDI_ERROR) {
+    HGDIOBJ old = NULL;
+    if (!GdiSelect(dc, hbm, &old)) {
         DeleteDC(dc);
         DeleteObject(hbm);
         return NULL;
     }
     OverlayDraw(dc);
-    SelectObject(dc, old);
+    GdiRestore(dc, old, "overlay render bitmap");
     DeleteDC(dc);
 
     if (ppBits) *ppBits = bits;
@@ -3518,10 +3611,11 @@ static void TestMosaic(HWND parent)
     void   *dbits = NULL;
     HBITMAP dhbm = CreateDIBSection(NULL, &dbi, DIB_RGB_COLORS, &dbits, NULL, 0);
     HDC     ddc  = dhbm ? CreateCompatibleDC(NULL) : NULL;
-    HGDIOBJ dold = ddc ? SelectObject(ddc, dhbm) : NULL;
+    HGDIOBJ dold = NULL;
+    if (ddc && !GdiSelect(ddc, dhbm, &dold)) { DeleteDC(ddc); ddc = NULL; }
 
     ULONGLONG dtCached = 0, dtDirect = 0;
-    if (ddc && dold && dold != (HGDIOBJ)HGDI_ERROR) {
+    if (ddc) {
         DrawAnnotations(ddc);                       /* 先建缓存 */
         ULONGLONG t0 = GetTickCount64();
         for (int i = 0; i < 500; i++) DrawAnnotations(ddc);
@@ -3534,7 +3628,7 @@ static void TestMosaic(HWND parent)
         }
         dtDirect = GetTickCount64() - t1;
 
-        SelectObject(ddc, dold);
+        GdiRestore(ddc, dold, "mosaic bench bitmap");
         DeleteDC(ddc);
     }
     if (dhbm) DeleteObject(dhbm);
@@ -3583,7 +3677,7 @@ typedef struct { HDC dc; HBITMAP hbm; HGDIOBJ old; void *bits; } TestSurface;
 
 static void TestSurfaceDestroy(TestSurface *s)
 {
-    if (s->dc && s->old && s->old != (HGDIOBJ)HGDI_ERROR) SelectObject(s->dc, s->old);
+    if (s->dc && s->old) GdiRestore(s->dc, s->old, "test surface bitmap");
     if (s->dc)  DeleteDC(s->dc);
     if (s->hbm) DeleteObject(s->hbm);
     ZeroMemory(s, sizeof(*s));
@@ -3606,8 +3700,8 @@ static BOOL TestSurfaceCreate(TestSurface *s, int w, int h)
     if (!s->hbm || !s->bits) goto fail;
     s->dc = CreateCompatibleDC(NULL);
     if (!s->dc) goto fail;
-    s->old = SelectObject(s->dc, s->hbm);
-    if (!s->old || s->old == (HGDIOBJ)HGDI_ERROR) goto fail;
+    s->old = NULL;
+    if (!GdiSelect(s->dc, s->hbm, &s->old)) goto fail;
     return TRUE;
 
 fail:
@@ -3886,53 +3980,83 @@ static void TestFileNames(void)
     RemoveDirectoryW(dir);
 }
 
-/* 用另一个线程占住指定组合，模拟"被其他程序占用" */
-static HANDLE g_hkReady, g_hkRelease, g_hkThread;
-static volatile LONG g_hkBlocked = 0;
-static UINT g_hkBlockMods, g_hkBlockVk;
+/* 用独立线程占住指定组合，模拟"被其他程序占用"。
+ * 支持多个槽位，用于"所有预设都被占用"的场景。 */
+#define HK_BLOCK_MAX 4
 
-static DWORD WINAPI HotkeyBlockerThread(LPVOID unused)
+typedef struct {
+    HANDLE ready, release, thread;
+    UINT   mods, vk;
+    volatile LONG ok;
+} HotkeyBlock;
+
+static HotkeyBlock g_hkBlocks[HK_BLOCK_MAX];
+
+static DWORD WINAPI HotkeyBlockerThread(LPVOID param)
 {
-    (void)unused;
+    HotkeyBlock *b = (HotkeyBlock *)param;
     HWND w = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 0, 0,
                              HWND_MESSAGE, NULL, NULL, NULL);
-    if (w && RegisterHotKey(w, 0xBEEF, g_hkBlockMods, g_hkBlockVk)) {
-        InterlockedExchange(&g_hkBlocked, 1);
-        SetEvent(g_hkReady);
-        WaitForSingleObject(g_hkRelease, INFINITE);
+    if (w && RegisterHotKey(w, 0xBEEF, b->mods, b->vk)) {
+        InterlockedExchange(&b->ok, 1);
+        SetEvent(b->ready);
+        WaitForSingleObject(b->release, INFINITE);
         UnregisterHotKey(w, 0xBEEF);
     } else {
-        SetEvent(g_hkReady);           /* 没占上，主线程会跳过这个用例 */
+        SetEvent(b->ready);            /* 没占上，主线程会跳过该用例 */
     }
     if (w) DestroyWindow(w);
     return 0;
 }
 
-/* 起一个占位线程；失败返回 NULL（调用方按 SKIP 处理） */
-static BOOL StartHotkeyBlocker(UINT mods, UINT vk)
+static void StopHotkeyBlocker(int slot)
 {
-    g_hkBlockMods = mods;
-    g_hkBlockVk   = vk;
-    g_hkReady     = CreateEventW(NULL, TRUE, FALSE, NULL);
-    g_hkRelease   = CreateEventW(NULL, TRUE, FALSE, NULL);
-    InterlockedExchange(&g_hkBlocked, 0);
-    if (!g_hkReady || !g_hkRelease) return FALSE;
-    g_hkThread = CreateThread(NULL, 0, HotkeyBlockerThread, NULL, 0, NULL);
-    if (!g_hkThread) return FALSE;
-    WaitForSingleObject(g_hkReady, 3000);
-    return (InterlockedCompareExchange(&g_hkBlocked, 1, 1) == 1);
+    if (slot < 0 || slot >= HK_BLOCK_MAX) return;
+    HotkeyBlock *b = &g_hkBlocks[slot];
+
+    if (b->release) SetEvent(b->release);
+    if (b->thread) {
+        WaitForSingleObject(b->thread, 3000);
+        CloseHandle(b->thread);
+        b->thread = NULL;
+    }
+    if (b->ready)   { CloseHandle(b->ready);   b->ready = NULL; }
+    if (b->release) { CloseHandle(b->release); b->release = NULL; }
+    b->mods = b->vk = 0;
+    InterlockedExchange(&b->ok, 0);
 }
 
-static void StopHotkeyBlocker(void)
+/* 启动一个占位线程；成功占住返回 TRUE */
+static BOOL StartHotkeyBlocker(int slot, UINT mods, UINT vk)
 {
-    if (g_hkRelease) SetEvent(g_hkRelease);
-    if (g_hkThread) {
-        WaitForSingleObject(g_hkThread, 3000);
-        CloseHandle(g_hkThread);
-        g_hkThread = NULL;
-    }
-    if (g_hkReady)   { CloseHandle(g_hkReady);   g_hkReady = NULL; }
-    if (g_hkRelease) { CloseHandle(g_hkRelease); g_hkRelease = NULL; }
+    if (slot < 0 || slot >= HK_BLOCK_MAX) return FALSE;
+    StopHotkeyBlocker(slot);
+
+    HotkeyBlock *b = &g_hkBlocks[slot];
+    b->mods    = mods;
+    b->vk      = vk;
+    b->ready   = CreateEventW(NULL, TRUE, FALSE, NULL);
+    b->release = CreateEventW(NULL, TRUE, FALSE, NULL);
+    InterlockedExchange(&b->ok, 0);
+    if (!b->ready || !b->release) return FALSE;
+
+    b->thread = CreateThread(NULL, 0, HotkeyBlockerThread, b, 0, NULL);
+    if (!b->thread) return FALSE;
+
+    WaitForSingleObject(b->ready, 3000);
+    return (InterlockedCompareExchange(&b->ok, 1, 1) == 1);
+}
+
+/* 探测某个组合当前是否可注册（用于避免触发会阻塞的 MessageBox） */
+static BOOL HotkeyComboFree(UINT mods, UINT vk)
+{
+    HWND w = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0,
+                             HWND_MESSAGE, NULL, NULL, NULL);
+    if (!w) return FALSE;
+    BOOL ok = RegisterHotKey(w, 0xBEEA, mods, vk);
+    if (ok) UnregisterHotKey(w, 0xBEEA);
+    DestroyWindow(w);
+    return ok;
 }
 
 static void TestHotkey(void)
@@ -3954,8 +4078,8 @@ static void TestHotkey(void)
     UINT idBefore = g_hotkeyId;
     UINT aM = g_mods, aV = g_vk;
 
-    if (!StartHotkeyBlocker(MOD_CONTROL | MOD_ALT, VK_F11)) {
-        StopHotkeyBlocker();
+    if (!StartHotkeyBlocker(0, MOD_CONTROL | MOD_ALT, VK_F11)) {
+        StopHotkeyBlocker(0);
         HotkeyUnregisterActive();
         TestCheck(!g_hotkeyOk && g_hotkeyId == 0, "hotkey unregistered");
         return;
@@ -3969,11 +4093,54 @@ static void TestHotkey(void)
 
     TestCheck(HotkeyTryApply(MOD_CONTROL | MOD_SHIFT, VK_F12), "switch to free hotkey works");
 
-    StopHotkeyBlocker();
+    StopHotkeyBlocker(0);
     TestCheck(HotkeyTryApply(MOD_CONTROL | MOD_ALT, VK_F11), "released combo can be applied");
 
     HotkeyUnregisterActive();
     TestCheck(!g_hotkeyOk && g_hotkeyId == 0, "hotkey unregistered");
+}
+
+/* ---- 测试用的注册表读写（仅在自检里使用，测试结束会还原） ---- */
+
+static BOOL RegReadDword(const WCHAR *name, DWORD *out)
+{
+    HKEY k;
+    DWORD v = 0, sz = sizeof(v), type = 0;
+    BOOL ok = FALSE;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH, 0, KEY_QUERY_VALUE, &k) == ERROR_SUCCESS) {
+        if (RegQueryValueExW(k, name, NULL, &type, (BYTE *)&v, &sz) == ERROR_SUCCESS &&
+            type == REG_DWORD && sz == sizeof(DWORD)) {
+            *out = v;
+            ok = TRUE;
+        }
+        RegCloseKey(k);
+    }
+    return ok;
+}
+
+static void RegDeleteDword(const WCHAR *name)
+{
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH, 0, KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
+        RegDeleteValueW(k, name);
+        RegCloseKey(k);
+    }
+}
+
+typedef struct { BOOL hadMods, hadVk; DWORD mods, vk; } RegBackup;
+
+static void RegBackupHotkey(RegBackup *b)
+{
+    b->hadMods = RegReadDword(L"HotMods", &b->mods);
+    b->hadVk   = RegReadDword(L"HotVk", &b->vk);
+}
+
+static void RegRestoreHotkey(const RegBackup *b)
+{
+    if (b->hadMods) SaveSettingDword(L"HotMods", b->mods);
+    else            RegDeleteDword(L"HotMods");
+    if (b->hadVk)   SaveSettingDword(L"HotVk", b->vk);
+    else            RegDeleteDword(L"HotVk");
 }
 
 /* 启动恢复：保存的组合被占用时自动回退到其它预设，且不写注册表 */
@@ -3982,12 +4149,17 @@ static void TestHotkeyStartupFallback(void)
     const UINT savedM = MOD_CONTROL | MOD_SHIFT;
     const UINT savedV = 'A';               /* 预设 3，故意占住它 */
 
+    RegBackup bk;
+    RegBackupHotkey(&bk);
+    SaveSettingDword(L"HotMods", savedM);  /* 让注册表与"保存的配置"一致 */
+    SaveSettingDword(L"HotVk", savedV);
+
     g_hotkeyId = 0;
     g_hotkeyOk = FALSE;
     g_mods = savedM;
     g_vk   = savedV;
 
-    BOOL blocked = StartHotkeyBlocker(savedM, savedV);
+    BOOL blocked = StartHotkeyBlocker(0, savedM, savedV);
     int r = HotkeyRegisterOnStartup();
     printf("startup hotkey: blocked=%d result=%d mods=0x%X vk=0x%X\n",
            blocked, r, g_mods, g_vk);
@@ -3999,41 +4171,291 @@ static void TestHotkeyStartupFallback(void)
         TestCheck(g_mods == (UINT)(MOD_CONTROL | MOD_ALT) ||
                   g_mods == (UINT)(MOD_ALT | MOD_SHIFT),
                   "fallback comes from preset list");
+
+        DWORD rm = 0, rv = 0;
+        TestCheck(RegReadDword(L"HotMods", &rm) && rm == savedM &&
+                  RegReadDword(L"HotVk", &rv) && rv == savedV,
+                  "fallback keeps the saved config in registry");
     } else {
         printf("[SKIP] startup fallback: Ctrl+Shift+A already taken by another app\n");
     }
-    StopHotkeyBlocker();
+    StopHotkeyBlocker(0);
     HotkeyUnregisterActive();
     TestCheck(!g_hotkeyOk && g_hotkeyId == 0, "startup hotkey released");
+
+    /* 原组合释放后再启动一次：应优先回到用户保存的组合 */
+    g_hotkeyId = 0;
+    g_hotkeyOk = FALSE;
+    g_mods = savedM;
+    g_vk   = savedV;
+    int r2 = HotkeyRegisterOnStartup();
+    TestCheck(r2 == HK_START_SAVED && g_hotkeyOk &&
+              g_mods == savedM && g_vk == savedV,
+              "next start prefers the saved combo once it is free");
+    HotkeyUnregisterActive();
 
     /* 保存的组合空闲时，启动应直接用它，不做无谓回退 */
     g_hotkeyId = 0;
     g_hotkeyOk = FALSE;
     g_mods = MOD_CONTROL | MOD_ALT;
     g_vk   = VK_F9;
-    int r2 = HotkeyRegisterOnStartup();
-    TestCheck(r2 == HK_START_SAVED && g_hotkeyOk, "startup uses saved hotkey when free");
+    int r3 = HotkeyRegisterOnStartup();
+    TestCheck(r3 == HK_START_SAVED && g_hotkeyOk, "startup uses saved hotkey when free");
     HotkeyUnregisterActive();
+
+    RegRestoreHotkey(&bk);
 }
 
-/* GDI 句柄选入/恢复的防御逻辑（无法真的把 GDI 用尽，只验证非法入参被拒） */
-static void TestGdiGuards(void)
+/* 所有预设都被占用：程序仍能启动，托盘菜单仍能切换并持久化 */
+static void TestHotkeyAllOccupied(void)
+{
+    RegBackup bk;
+    RegBackupHotkey(&bk);
+
+    /* 哨兵值：回退/失败都不能动它 */
+    SaveSettingDword(L"HotMods", MOD_CONTROL | MOD_SHIFT);
+    SaveSettingDword(L"HotVk", 'A');
+
+    int blockedAll = 0;
+    for (int i = 0; i < PRESET_COUNT && i < HK_BLOCK_MAX; i++) {
+        if (StartHotkeyBlocker(i, g_presets[i].mods, g_presets[i].vk)) blockedAll++;
+    }
+
+    g_hotkeyId = 0;
+    g_hotkeyOk = FALSE;
+    g_mods = MOD_CONTROL | MOD_SHIFT;      /* 保存的是预设 3 */
+    g_vk   = 'A';
+
+    int r = HotkeyRegisterOnStartup();
+    printf("startup all occupied: blocked=%d/%d result=%d hotkeyOk=%d\n",
+           blockedAll, PRESET_COUNT, r, (int)g_hotkeyOk);
+
+    if (blockedAll == PRESET_COUNT) {
+        TestCheck(r == HK_START_NONE && !g_hotkeyOk,
+                  "startup survives when every preset is occupied");
+
+        DWORD rm = 0, rv = 0;
+        TestCheck(RegReadDword(L"HotMods", &rm) && rm == (MOD_CONTROL | MOD_SHIFT) &&
+                  RegReadDword(L"HotVk", &rv) && rv == (DWORD)'A',
+                  "failed startup leaves registry untouched");
+
+        /* 释放预设 1（Ctrl+Alt+A）后，模拟用户从托盘菜单选择它 */
+        StopHotkeyBlocker(0);
+        if (HotkeyComboFree(g_presets[0].mods, g_presets[0].vk)) {
+            SendMessageW(g_hMsgWnd, WM_COMMAND, MENU_HK_BASE + 0, 0);
+            TestCheck(g_hotkeyOk && g_mods == g_presets[0].mods && g_vk == g_presets[0].vk,
+                      "menu switch works after a failed startup");
+            TestCheck(RegReadDword(L"HotMods", &rm) && rm == g_presets[0].mods &&
+                      RegReadDword(L"HotVk", &rv) && rv == (DWORD)g_presets[0].vk,
+                      "menu switch persists the new hotkey");
+        } else {
+            printf("[SKIP] all-occupied menu switch: Ctrl+Alt+A not free for the probe\n");
+        }
+    } else {
+        printf("[SKIP] all-occupied: 无法同时占住全部预设（本机已有程序占用）\n");
+    }
+
+    for (int i = 0; i < HK_BLOCK_MAX; i++) StopHotkeyBlocker(i);
+    HotkeyUnregisterActive();
+
+    RegRestoreHotkey(&bk);
+}
+
+/* GDI 句柄生命周期：选入/恢复/释放的成功与失败分支、临时字体与画笔循环 */
+static void TestGdiLifecycle(void)
 {
     TestSurface s;
-    if (!TestSurfaceCreate(&s, 8, 8)) { TestCheck(FALSE, "gdi guards: surface"); return; }
+    if (!TestSurfaceCreate(&s, 16, 16)) { TestCheck(FALSE, "gdi: surface"); return; }
 
+    /* --- 非法入参 --- */
     HGDIOBJ old = NULL;
-    TestCheck(!GdiSelect(NULL, GetStockObject(BLACK_PEN), &old), "gdi guards: NULL dc rejected");
-    TestCheck(!GdiSelect(s.dc, NULL, &old), "gdi guards: NULL object rejected");
-    GdiRestore(NULL, NULL);                     /* 空入参不应影响任何 DC 状态 */
+    TestCheck(!GdiSelect(NULL, GetStockObject(BLACK_PEN), &old), "gdi: NULL dc rejected");
+    TestCheck(!GdiSelect(s.dc, NULL, &old), "gdi: NULL object rejected");
+    TestCheck(!GdiRestore(NULL, GetStockObject(BLACK_PEN), "null dc"),
+              "gdi: restore with NULL dc rejected");
+    TestCheck(!GdiRestore(s.dc, NULL, "null obj"), "gdi: restore with NULL object rejected");
 
-    HPEN pen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+    /* --- 成功路径：选入 → 使用 → 恢复 → 删除 --- */
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(255, 0, 0));
     if (pen) {
-        TestCheck(GdiSelect(s.dc, pen, &old), "gdi guards: valid object selected");
-        GdiRestore(s.dc, old);
-        DeleteObject(pen);
+        HGDIOBJ op = NULL;
+        TestCheck(GdiSelect(s.dc, pen, &op), "gdi: select pen");
+        TestCheck(GdiRestore(s.dc, op, "pen restore"), "gdi: restore pen");
+        TestCheck(DeleteObject(pen) ? TRUE : FALSE, "gdi: delete after successful restore");
     }
+
+    /* --- 恢复失败识别：拿一个已删除对象的句柄当“原对象” --- */
+    HPEN dead = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+    if (dead) {
+        DeleteObject(dead);                     /* 句柄失效，之后再无 GDI 分配，不会被复用 */
+        TestCheck(!GdiRestore(s.dc, dead, "dead handle"), "gdi: restore failure detected");
+
+        /* 失败之后 DC 仍然可用（说明没有把 DC 卡在非法状态） */
+        HGDIOBJ op2 = NULL;
+        TestCheck(GdiSelect(s.dc, GetStockObject(BLACK_PEN), &op2) &&
+                  GdiRestore(s.dc, op2, "dc usable"),
+                  "gdi: dc usable after failed restore");
+    }
+
+    /* --- 释放流程：恢复失败时必须如实返回 FALSE，且临时对象仍要删掉 --- */
+    HPEN temp = CreatePen(PS_SOLID, 1, RGB(0, 0, 255));
+    HPEN dead2 = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+    if (temp && dead2) {
+        DeleteObject(dead2);
+        HGDIOBJ op = NULL;
+        BOOL sel = GdiSelect(s.dc, temp, &op);
+        DWORD gBefore = GdiCount();
+        BOOL rel = GdiRelease(s.dc, temp, dead2, NULL_PEN, "release fallback");
+        DWORD gAfter = GdiCount();
+        TestCheck(sel && !rel, "gdi: release reports restore failure instead of success");
+        TestCheck(gAfter <= gBefore, "gdi: temp object not leaked after failed restore");
+
+        LOGPEN lp;
+        TestCheck(GetObjectW(temp, sizeof(lp), &lp) == 0, "gdi: temp object really deleted");
+    } else {
+        if (temp)  DeleteObject(temp);
+        if (dead2) DeleteObject(dead2);
+    }
+    GdiRestore(s.dc, (HGDIOBJ)GetStockObject(BLACK_PEN), "reset test dc");
+
+    /* --- 临时字体：选入、测量、恢复、释放，循环 1000 次 --- */
+    DWORD f0 = GdiCount();
+    int ffail = 0;
+    for (int i = 0; i < 1000; i++) {
+        HFONT f = CreateFontW(-16, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                              L"Microsoft YaHei UI");
+        if (!f) { ffail++; continue; }
+
+        HGDIOBJ of = NULL;
+        if (!GdiSelect(s.dc, f, &of)) { DeleteObject(f); ffail++; continue; }
+
+        SIZE sz = {0, 0};
+        GetTextExtentPoint32W(s.dc, L"loop", 4, &sz);
+        if (!GdiRelease(s.dc, f, of, DEFAULT_GUI_FONT, "loop font")) ffail++;
+        if (sz.cx <= 0) ffail++;
+    }
+    DWORD f1 = GdiCount();
+    printf("gdi font loop: 1000x, gdi %lu -> %lu, fails=%d\n", f0, f1, ffail);
+    TestCheck(ffail == 0, "gdi: font create/select/restore/delete 1000x");
+    TestCheck(f1 <= f0 + 2, "gdi: font loop does not grow gdi count");
+
+    /* --- 临时画笔：同样循环 1000 次 --- */
+    DWORD p0 = GdiCount();
+    int pfail = 0;
+    for (int i = 0; i < 1000; i++) {
+        HPEN p = CreatePen(PS_SOLID, 1 + (i % 3), RGB(10, 20, 30));
+        if (!p) { pfail++; continue; }
+        HGDIOBJ op = NULL;
+        if (!GdiSelect(s.dc, p, &op)) { DeleteObject(p); pfail++; continue; }
+        MoveToEx(s.dc, 0, 0, NULL);
+        LineTo(s.dc, 8, 8);
+        if (!GdiRelease(s.dc, p, op, NULL_PEN, "loop pen")) pfail++;
+    }
+    DWORD p1 = GdiCount();
+    printf("gdi pen loop: 1000x, gdi %lu -> %lu, fails=%d\n", p0, p1, pfail);
+    TestCheck(pfail == 0, "gdi: pen create/select/restore/delete 1000x");
+    TestCheck(p1 <= p0 + 2, "gdi: pen loop does not grow gdi count");
+
+    /* 再跑一轮：第一次画线可能产生一次性的 GDI 内部缓存，
+     * 第二轮增量必须为 0，才能证明不是每次调用都在泄漏 */
+    for (int i = 0; i < 1000; i++) {
+        HPEN p = CreatePen(PS_SOLID, 1 + (i % 3), RGB(30, 20, 10));
+        if (!p) { pfail++; continue; }
+        HGDIOBJ op = NULL;
+        if (!GdiSelect(s.dc, p, &op)) { DeleteObject(p); pfail++; continue; }
+        MoveToEx(s.dc, 0, 0, NULL);
+        LineTo(s.dc, 8, 8);
+        if (!GdiRelease(s.dc, p, op, NULL_PEN, "loop pen 2")) pfail++;
+    }
+    DWORD p2 = GdiCount();
+    printf("gdi pen loop: second 1000x, gdi %lu -> %lu\n", p1, p2);
+    TestCheck(pfail == 0, "gdi: pen loop second batch has no failures");
+    TestCheck(p2 <= p1, "gdi: pen loop is steady after first batch");
+
     TestSurfaceDestroy(&s);
+}
+
+/* TextAnnotRect / DrawTextAnnot 在字体选入失败时必须安全退出且不泄漏字体 */
+static void TestTextAnnotSelectFailure(void)
+{
+    Annot a;
+    ZeroMemory(&a, sizeof(a));
+    a.kind  = AN_TEXT;
+    a.x     = 10;
+    a.y     = 20;
+    a.fontH = 20;
+    lstrcpynW(a.text, L"测量失败测试", 256);
+
+    DWORD g0 = GdiCount();
+    g_gdiFailInject = 1;                   /* 让第一次 GdiSelect 失败 */
+    RECT r;
+    TextAnnotRect(&a, &r);
+    g_gdiFailInject = 0;
+    DWORD g1 = GdiCount();
+
+    printf("text measure: injected select failure, rect %ldx%ld, gdi %lu -> %lu\n",
+           r.right - r.left, r.bottom - r.top, g0, g1);
+    TestCheck(r.left == a.x && r.top == a.y && r.right == r.left && r.bottom == r.top,
+              "text measure: failed select yields zero-size rect");
+    TestCheck(g1 <= g0, "text measure: font not leaked on select failure");
+
+    /* 绘制路径同理：只跳过这次绘制，不泄漏字体、不影响 DC */
+    TestSurface s;
+    if (TestSurfaceCreate(&s, 32, 32)) {
+        DWORD h0 = GdiCount();
+        g_gdiFailInject = 1;
+        DrawTextAnnot(s.dc, &a);
+        g_gdiFailInject = 0;
+        DWORD h1 = GdiCount();
+        TestCheck(h1 <= h0, "text annot: select failure does not leak font");
+        TestSurfaceDestroy(&s);
+    } else {
+        TestCheck(FALSE, "text annot: surface");
+    }
+}
+
+/* RestoreOldBmp：正常释放路径 + 原对象句柄失效时的清理路径 */
+static void TestRestoreOldBmp(void)
+{
+    /* 正常路径：分配三份缓冲 → FreeCapture，GDI 应回到原值 */
+    DWORD g0 = GdiCount();
+    if (!OvAllocBuffers(64, 48)) {
+        TestCheck(FALSE, "restore: alloc capture buffers");
+        return;
+    }
+    DWORD g1 = GdiCount();
+    FreeCapture();
+    DWORD g2 = GdiCount();
+    printf("restore old bmp: gdi %lu -> %lu -> %lu\n", g0, g1, g2);
+    TestCheck(g1 == g0 + 6, "restore: capture buffers add 6 gdi objects");
+    TestCheck(g2 == g0, "restore: FreeCapture releases them");
+
+    /* 异常路径：原对象句柄已失效时，RestoreOldBmp 仍要清空记录并安全收尾 */
+    HDC dc = CreateCompatibleDC(NULL);
+    HBITMAP bmp = CreateBitmap(4, 4, 1, 32, NULL);
+    if (!dc || !bmp) {
+        if (dc) DeleteDC(dc);
+        if (bmp) DeleteObject(bmp);
+        TestCheck(FALSE, "restore: create test dc/bitmap");
+        return;
+    }
+
+    HGDIOBJ selected = NULL;
+    BOOL okSel = GdiSelect(dc, bmp, &selected);
+
+    HPEN dead = CreatePen(PS_SOLID, 1, RGB(1, 2, 3));
+    if (dead) DeleteObject(dead);          /* 失效句柄冒充“原对象” */
+
+    HGDIOBJ bad = dead;
+    RestoreOldBmp(dc, &bad);
+    TestCheck(okSel && bad == NULL, "restore: invalid old handle is cleared");
+
+    /* 还原失败时位图仍在 DC 里；DeleteDC 会解除引用，随后必须能删除成功 */
+    DeleteDC(dc);
+    TestCheck(DeleteObject(bmp) ? TRUE : FALSE,
+              "restore: bitmap deletable after forced restore failure");
 }
 
 /* 预热：先把各子系统的一次性系统缓存（EDIT 控件内部对象、GDI+ 全局对象等）
@@ -4092,8 +4514,12 @@ static int RunStabilityTest(void)
                                    0, 0, 640, 480, NULL, NULL, g_hInst, NULL);
     if (!overlay) { printf("FAIL: overlay window\n"); DestroyWindow(g_hMsgWnd); return 1; }
 
+    /* 预热两遍：第一遍会把 GDI / GDI+ / 字体子系统的进程级一次性缓存建出来，
+     * 第二遍之后基线才稳定，避免把一次性缓存误判成泄漏 */
+    WarmUpAll(overlay);
     WarmUpAll(overlay);
     DWORD g0 = GdiCount();
+    printf("  gdi after warmup: %lu\n", g0);
 
     TestCaptureLoop();
     printf("  gdi after capture: %lu\n", GdiCount());
@@ -4108,7 +4534,10 @@ static int RunStabilityTest(void)
     TestFileNames();
     TestHotkey();
     TestHotkeyStartupFallback();
-    TestGdiGuards();
+    TestHotkeyAllOccupied();
+    TestGdiLifecycle();
+    TestTextAnnotSelectFailure();
+    TestRestoreOldBmp();
 
     /* 模拟一次正常退出：窗口销毁 + 资源统一释放 */
     if (g_ov.hwnd == overlay) g_ov.hwnd = NULL;
