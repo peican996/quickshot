@@ -39,6 +39,7 @@
 #define APP_TITLE  L"QuickShot  截图 (Ctrl+Alt+A)"
 
 #define HOTKEY_ID        0xA001
+#define HOTKEY_ID_ALT    0xA002   /* 切换热键时的备用 ID：先注册新的，成功后再注销旧的 */
 #define WM_TRAY          (WM_APP + 1)
 #define WM_OV_CLOSE      (WM_APP + 2)
 #define TRAY_UID         1
@@ -63,8 +64,10 @@ static HINSTANCE  g_hInst;
 static HWND       g_hMsgWnd;          /* 隐藏的消息窗口（托盘 + 热键） */
 static NOTIFYICONDATAW g_nid;
 static ULONG_PTR  g_gdiToken;
+static BOOL       g_gdiplusOk = FALSE;   /* GDI+ 初始化是否成功，失败时禁止走导出/编码路径 */
 static BOOL       g_saveFile = TRUE;
 static BOOL       g_hotkeyOk = FALSE;
+static UINT       g_hotkeyId = 0;        /* 当前实际注册的热键 ID，0 = 未注册 */
 static UINT       g_mods = MOD_CONTROL | MOD_ALT;
 static UINT       g_vk   = 'A';
 static WCHAR      g_saveDir[MAX_PATH];
@@ -110,6 +113,8 @@ typedef struct {
     HWND    hwnd;
     HBITMAP hbmCap, hbmDim, hbmBack;
     HDC     hdcCap, hdcDim, hdcBack;
+    /* SelectObject 前 DC 里原来的位图，DeleteDC 之前必须选回去，否则位图删不掉 */
+    HGDIOBJ oldBmpCap, oldBmpDim, oldBmpBack;
     void   *pixCap;        /* 32bpp top-down 原始像素 */
     int     vx, vy, vw, vh;
 
@@ -185,6 +190,7 @@ static int g_editEditing = -1;      /* 正在二次编辑的文字标注下标�
 
 static HWND    g_edit;           /* 文字输入框 */
 static WNDPROC g_editOldProc;
+static HFONT   g_editFont;       /* 输入框字体：WM_SETFONT 只存句柄不复制，控件销毁后才能释放 */
 static HFONT   g_fontText, g_fontIcon;
 
 #define WM_EDIT_COMMIT (WM_APP + 11)
@@ -337,9 +343,21 @@ static void ResolveSaveDir(void)
 
 /* ---------------------------------------------------------------- 捕获 */
 
-/* 分配三份缓冲：原始 / 变暗底图 / 绘制后备 */
+static void FreeCapture(void);
+static void MosaicCacheFreeAll(void);
+
+/* 从 DC 上摘下我们自己选进去的位图。只有 SelectObject 成功过的才需要还原。 */
+static void RestoreOldBmp(HDC dc, HGDIOBJ *old)
+{
+    if (dc && *old && *old != (HGDIOBJ)HGDI_ERROR) SelectObject(dc, *old);
+    *old = NULL;
+}
+
+/* 分配三份缓冲：原始 / 变暗底图 / 绘制后备。
+ * 任何一步失败都直接走 FreeCapture 收干净，不留下半套资源。 */
 static BOOL OvAllocBuffers(int w, int h)
 {
+    BOOL ok = FALSE;
     HDC hdcScreen = GetDC(NULL);
     if (!hdcScreen) return FALSE;
 
@@ -353,29 +371,42 @@ static BOOL OvAllocBuffers(int w, int h)
     bi.bmiHeader.biCompression = BI_RGB;
 
     g_ov.hbmCap  = CreateDIBSection(hdcScreen, &bi, DIB_RGB_COLORS, &g_ov.pixCap, NULL, 0);
+    if (!g_ov.hbmCap || !g_ov.pixCap) goto done;
     g_ov.hbmDim  = CreateDIBSection(hdcScreen, &bi, DIB_RGB_COLORS, NULL, NULL, 0);
+    if (!g_ov.hbmDim) goto done;
     g_ov.hbmBack = CreateDIBSection(hdcScreen, &bi, DIB_RGB_COLORS, NULL, NULL, 0);
-    if (!g_ov.hbmCap || !g_ov.hbmDim || !g_ov.hbmBack) {
-        ReleaseDC(NULL, hdcScreen);
-        return FALSE;
-    }
+    if (!g_ov.hbmBack) goto done;
 
     g_ov.hdcCap  = CreateCompatibleDC(hdcScreen);
     g_ov.hdcDim  = CreateCompatibleDC(hdcScreen);
     g_ov.hdcBack = CreateCompatibleDC(hdcScreen);
-    ReleaseDC(NULL, hdcScreen);
-    if (!g_ov.hdcCap || !g_ov.hdcDim || !g_ov.hdcBack) return FALSE;
+    if (!g_ov.hdcCap || !g_ov.hdcDim || !g_ov.hdcBack) goto done;
 
-    SelectObject(g_ov.hdcCap,  g_ov.hbmCap);
-    SelectObject(g_ov.hdcDim,  g_ov.hbmDim);
-    SelectObject(g_ov.hdcBack, g_ov.hbmBack);
-    return TRUE;
+    g_ov.oldBmpCap  = SelectObject(g_ov.hdcCap,  g_ov.hbmCap);
+    if (!g_ov.oldBmpCap || g_ov.oldBmpCap == (HGDIOBJ)HGDI_ERROR) goto done;
+    g_ov.oldBmpDim  = SelectObject(g_ov.hdcDim,  g_ov.hbmDim);
+    if (!g_ov.oldBmpDim || g_ov.oldBmpDim == (HGDIOBJ)HGDI_ERROR) goto done;
+    g_ov.oldBmpBack = SelectObject(g_ov.hdcBack, g_ov.hbmBack);
+    if (!g_ov.oldBmpBack || g_ov.oldBmpBack == (HGDIOBJ)HGDI_ERROR) goto done;
+
+    ok = TRUE;
+
+done:
+    ReleaseDC(NULL, hdcScreen);
+    if (!ok) {
+        QSLog("OvAllocBuffers: FAIL %dx%d err=%lu", w, h, GetLastError());
+        FreeCapture();
+    }
+    return ok;
 }
 
-/* 由 hdcCap 生成变暗底图（约 45% 亮度），并把原图 alpha 归位 */
-static void OvDimBuffers(void)
+/* 由 hdcCap 生成变暗底图（约 45% 亮度），并把原图 alpha 归位。
+ * BitBlt 失败时底图内容不可信，返回 FALSE 让上层放弃这次截图。 */
+static BOOL OvDimBuffers(void)
 {
-    BitBlt(g_ov.hdcDim, 0, 0, g_ov.vw, g_ov.vh, g_ov.hdcCap, 0, 0, SRCCOPY);
+    if (!g_ov.hdcDim || !g_ov.hdcCap) return FALSE;
+    if (!BitBlt(g_ov.hdcDim, 0, 0, g_ov.vw, g_ov.vh, g_ov.hdcCap, 0, 0, SRCCOPY))
+        return FALSE;
 
     BITMAP bm;
     if (GetObjectW(g_ov.hbmDim, sizeof(bm), &bm)) {
@@ -397,10 +428,13 @@ static void OvDimBuffers(void)
         size_t n = (size_t)g_ov.vw * g_ov.vh;
         for (size_t i = 0; i < n; i++) cap[i * 4 + 3] = 255;
     }
+    return TRUE;
 }
 
+/* 抓整屏。任一步失败都会把已经建好的资源收干净，返回 FALSE 时不留半套缓冲。 */
 static BOOL CaptureVirtualScreen(void)
 {
+    FreeCapture();                     /* 上一次的残留先收干净，避免重复调用时泄漏 */
     ZeroMemory(&g_ov, sizeof(g_ov));
 
     g_ov.vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -412,25 +446,37 @@ static BOOL CaptureVirtualScreen(void)
     if (!OvAllocBuffers(g_ov.vw, g_ov.vh)) return FALSE;
 
     HDC hdcScreen = GetDC(NULL);
-    if (!hdcScreen) return FALSE;
+    if (!hdcScreen) { FreeCapture(); return FALSE; }
 
     /* 抓屏；带 CAPTUREBLT 才能抓到分层窗口，失败则退回普通模式 */
-    if (!BitBlt(g_ov.hdcCap, 0, 0, g_ov.vw, g_ov.vh,
-                hdcScreen, g_ov.vx, g_ov.vy, SRCCOPY | CAPTUREBLT)) {
-        if (!BitBlt(g_ov.hdcCap, 0, 0, g_ov.vw, g_ov.vh,
-                    hdcScreen, g_ov.vx, g_ov.vy, SRCCOPY)) {
-            ReleaseDC(NULL, hdcScreen);
-            return FALSE;
-        }
+    BOOL blt = BitBlt(g_ov.hdcCap, 0, 0, g_ov.vw, g_ov.vh,
+                      hdcScreen, g_ov.vx, g_ov.vy, SRCCOPY | CAPTUREBLT);
+    if (!blt) {
+        blt = BitBlt(g_ov.hdcCap, 0, 0, g_ov.vw, g_ov.vh,
+                     hdcScreen, g_ov.vx, g_ov.vy, SRCCOPY);
     }
     ReleaseDC(NULL, hdcScreen);
 
-    OvDimBuffers();
+    if (!blt) {
+        QSLog("CaptureVirtualScreen: BitBlt FAIL err=%lu", GetLastError());
+        FreeCapture();                 /* 像素不可信，别继续用 */
+        return FALSE;
+    }
+    if (!OvDimBuffers()) {
+        QSLog("CaptureVirtualScreen: dim FAIL");
+        FreeCapture();
+        return FALSE;
+    }
     return TRUE;
 }
 
 static void FreeCapture(void)
 {
+    /* 先选回原位图，再删 DC，最后删位图：顺序错了位图会删不掉 */
+    RestoreOldBmp(g_ov.hdcCap,  &g_ov.oldBmpCap);
+    RestoreOldBmp(g_ov.hdcDim,  &g_ov.oldBmpDim);
+    RestoreOldBmp(g_ov.hdcBack, &g_ov.oldBmpBack);
+
     if (g_ov.hdcCap)  { DeleteDC(g_ov.hdcCap);  g_ov.hdcCap = NULL; }
     if (g_ov.hdcDim)  { DeleteDC(g_ov.hdcDim);  g_ov.hdcDim = NULL; }
     if (g_ov.hdcBack) { DeleteDC(g_ov.hdcBack); g_ov.hdcBack = NULL; }
@@ -438,6 +484,9 @@ static void FreeCapture(void)
     if (g_ov.hbmDim)  { DeleteObject(g_ov.hbmDim);  g_ov.hbmDim = NULL; }
     if (g_ov.hbmBack) { DeleteObject(g_ov.hbmBack); g_ov.hbmBack = NULL; }
     g_ov.pixCap = NULL;
+
+    /* 底图没了，马赛克缓存也没意义了 */
+    MosaicCacheFreeAll();
 }
 
 /* ---------------------------------------------------------------- 读像素 / 输出 */
@@ -512,12 +561,77 @@ static void DrawArrowAnnot(HDC hdc, const Annot *a)
 }
 
 /* 马赛克：把目标区域切块、逐块取平均色涂平。
- * 直接读 hdc 上现有的像素，所以实时预览和烘焙成图两条路都能复用。 */
-static void DrawMosaicAnnot(HDC hdc, const Annot *a)
+ * 直接读 hdc 上现有的像素，所以实时预览和烘焙成图两条路都能复用。
+ *
+ * 性能：每帧重绘都临时建 DIB、逐块算平均色，标注一多就会拖慢重绘和拖动。
+ * 这里给每条马赛克标注留一份结果缓存，只有下面这些情况才重算：
+ *   - 标注区域变了（拖动/缩放马赛克框）
+ *   - 选区变了（选区内外明暗不同，取到的底图会变）
+ *   - 场景版本变了（新增/撤销/文字改写后由 MosaicEpochBump 递增）
+ *   - 换了底图（FreeCapture 会整体清空缓存）
+ * 预览和导出共用同一份缓存，因此两条路的像素结果保持一致。
+ */
+#define MOSAIC_CACHE_MAX_PIXELS (8 * 1024 * 1024)   /* 单条马赛克缓存上限，超过就不缓存 */
+#define MOSAIC_CACHE_BUDGET     (16 * 1024 * 1024)  /* 所有缓存合计上限（约 64MB），防止极端情况吃满内存 */
+
+typedef struct {
+    HBITMAP  hbm;
+    HDC      hdc;
+    HGDIOBJ  oldBmp;       /* 建 DC 时原来的位图，销毁前要选回去 */
+    void    *bits;
+    int      capW, capH;   /* DIB 实际尺寸，够用就复用，避免拖动时反复重建 */
+    RECT     rc;           /* 生成缓存时的标注区域 */
+    RECT     sel;          /* 生成缓存时的选区 */
+    unsigned epoch;        /* 生成缓存时的场景版本，0 表示空 */
+} MosaicCache;
+
+static MosaicCache g_mosaicCache[MAX_ANNOT];
+static MosaicCache g_mosaicScratch;      /* 超大区域走的临时缓冲，不参与缓存 */
+static unsigned     g_mosaicEpoch = 1;
+static size_t       g_mosaicCachedPixels;  /* 当前缓存占用的像素总数，用于总预算 */
+
+static BOOL RectEq(RECT a, RECT b);
+
+static void MosaicCacheFree(MosaicCache *c)
 {
-    int w = a->rc.right - a->rc.left;
-    int h = a->rc.bottom - a->rc.top;
-    if (w < 2 || h < 2) return;
+    if (c->capW > 0 && c->capH > 0) {     /* 归还预算 */
+        size_t px = (size_t)c->capW * (size_t)c->capH;
+        g_mosaicCachedPixels = (g_mosaicCachedPixels >= px) ? g_mosaicCachedPixels - px : 0;
+    }
+    if (c->hdc) {
+        if (c->oldBmp && c->oldBmp != (HGDIOBJ)HGDI_ERROR) SelectObject(c->hdc, c->oldBmp);
+        DeleteDC(c->hdc);
+        c->hdc = NULL;
+    }
+    c->oldBmp = NULL;
+    if (c->hbm) { DeleteObject(c->hbm); c->hbm = NULL; }
+    c->bits = NULL;
+    c->capW = c->capH = 0;
+    c->epoch = 0;
+    SetRectEmpty(&c->rc);
+    SetRectEmpty(&c->sel);
+}
+
+static void MosaicCacheFreeAll(void)
+{
+    for (int i = 0; i < MAX_ANNOT; i++) MosaicCacheFree(&g_mosaicCache[i]);
+    MosaicCacheFree(&g_mosaicScratch);
+}
+
+/* 标注内容或顺序变化后调用：旧缓存全部作废，下次绘制时重算 */
+static void MosaicEpochBump(void)
+{
+    if (++g_mosaicEpoch == 0) {          /* 版本号回绕，直接清空避免误命中 */
+        MosaicCacheFreeAll();
+        g_mosaicEpoch = 1;
+    }
+}
+
+/* 准备一块至少 w×h 的 32bpp DIB 作为缓存画布 */
+static BOOL MosaicEnsure(MosaicCache *c, int w, int h)
+{
+    if (c->hbm && c->hdc && c->bits && c->capW >= w && c->capH >= h) return TRUE;
+    MosaicCacheFree(c);
 
     BITMAPINFO bi;
     ZeroMemory(&bi, sizeof(bi));
@@ -528,19 +642,26 @@ static void DrawMosaicAnnot(HDC hdc, const Annot *a)
     bi.bmiHeader.biBitCount    = 32;
     bi.bmiHeader.biCompression = BI_RGB;
 
-    void *bits = NULL;
-    HDC screen = GetDC(NULL);
-    HBITMAP hbm = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
-    ReleaseDC(NULL, screen);
-    if (!hbm || !bits) { if (hbm) DeleteObject(hbm); return; }
+    c->hbm = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, &c->bits, NULL, 0);
+    if (!c->hbm || !c->bits) { MosaicCacheFree(c); return FALSE; }
 
-    HDC dc = CreateCompatibleDC(hdc);
-    HGDIOBJ old = SelectObject(dc, hbm);
+    c->hdc = CreateCompatibleDC(NULL);
+    if (!c->hdc) { MosaicCacheFree(c); return FALSE; }
 
-    BitBlt(dc, 0, 0, w, h, hdc, a->rc.left, a->rc.top, SRCCOPY);
+    c->oldBmp = SelectObject(c->hdc, c->hbm);
+    if (!c->oldBmp || c->oldBmp == (HGDIOBJ)HGDI_ERROR) { MosaicCacheFree(c); return FALSE; }
 
-    int bs = MOSAIC_BLOCK;
-    BYTE *p = (BYTE *)bits;
+    c->capW = w;
+    c->capH = h;
+    g_mosaicCachedPixels += (size_t)w * (size_t)h;
+    return TRUE;
+}
+
+/* 逐块取平均色并涂平。stride 是 DIB 的实际行字节数（capW * 4），
+ * 可能比 w * 4 宽，所以按 stride 定位行、只处理前 w 个像素。 */
+static void MosaicQuantize(BYTE *p, int stride, int w, int h)
+{
+    const int bs = MOSAIC_BLOCK;
     for (int by = 0; by < h; by += bs) {
         int bh = min(bs, h - by);
         for (int bx = 0; bx < w; bx += bs) {
@@ -548,7 +669,7 @@ static void DrawMosaicAnnot(HDC hdc, const Annot *a)
             long sr = 0, sg = 0, sb = 0;
             int n = 0;
             for (int y = 0; y < bh; y++) {
-                BYTE *row = p + ((size_t)(by + y) * w + bx) * 4;
+                BYTE *row = p + (size_t)(by + y) * (size_t)stride + (size_t)bx * 4;
                 for (int x = 0; x < bw; x++) {
                     sb += row[x * 4 + 0];
                     sg += row[x * 4 + 1];
@@ -559,7 +680,7 @@ static void DrawMosaicAnnot(HDC hdc, const Annot *a)
             if (!n) continue;
             BYTE ar = (BYTE)(sr / n), ag = (BYTE)(sg / n), ab = (BYTE)(sb / n);
             for (int y = 0; y < bh; y++) {
-                BYTE *row = p + ((size_t)(by + y) * w + bx) * 4;
+                BYTE *row = p + (size_t)(by + y) * (size_t)stride + (size_t)bx * 4;
                 for (int x = 0; x < bw; x++) {
                     row[x * 4 + 0] = ab;
                     row[x * 4 + 1] = ag;
@@ -568,12 +689,41 @@ static void DrawMosaicAnnot(HDC hdc, const Annot *a)
             }
         }
     }
+}
 
-    BitBlt(hdc, a->rc.left, a->rc.top, w, h, dc, 0, 0, SRCCOPY);
+static void DrawMosaicAnnot(HDC hdc, const Annot *a, int idx)
+{
+    int w = a->rc.right - a->rc.left;
+    int h = a->rc.bottom - a->rc.top;
+    if (w < 2 || h < 2) return;
 
-    SelectObject(dc, old);
-    DeleteDC(dc);
-    DeleteObject(hbm);
+    size_t pixels = (size_t)w * (size_t)h;
+    MosaicCache *slot = (idx >= 0 && idx < MAX_ANNOT) ? &g_mosaicCache[idx] : NULL;
+    size_t slotPixels = slot ? (size_t)slot->capW * (size_t)slot->capH : 0;
+    /* 单条超限、或者加上它要突破总预算时，就退回不缓存的临时缓冲 */
+    BOOL cacheable = slot && pixels <= (size_t)MOSAIC_CACHE_MAX_PIXELS &&
+                     g_mosaicCachedPixels - slotPixels + pixels <= (size_t)MOSAIC_CACHE_BUDGET;
+    MosaicCache *c = cacheable ? slot : &g_mosaicScratch;
+
+    /* 缓存命中：直接贴回去，不碰 DIB、不做逐块平均 */
+    if (cacheable && c->hbm && c->hdc && c->bits &&
+        c->epoch == g_mosaicEpoch && c->capW >= w && c->capH >= h &&
+        RectEq(c->rc, a->rc) && RectEq(c->sel, g_ov.sel)) {
+        BitBlt(hdc, a->rc.left, a->rc.top, w, h, c->hdc, 0, 0, SRCCOPY);
+        return;
+    }
+
+    if (!MosaicEnsure(c, w, h)) return;
+    /* 没取到底图像素就别往下算，否则会把垃圾数据当马赛克贴出去 */
+    if (!BitBlt(c->hdc, 0, 0, w, h, hdc, a->rc.left, a->rc.top, SRCCOPY)) return;
+
+    MosaicQuantize((BYTE *)c->bits, c->capW * 4, w, h);
+    if (cacheable) {
+        c->rc    = a->rc;
+        c->sel   = g_ov.sel;
+        c->epoch = g_mosaicEpoch;
+    }
+    BitBlt(hdc, a->rc.left, a->rc.top, w, h, c->hdc, 0, 0, SRCCOPY);
 }
 
 /* 序号：实心圆 + 白色数字 */
@@ -630,7 +780,7 @@ static void DrawAnnotations(HDC hdc)
         case AN_RECT:    DrawRectAnnot(hdc, &g_ann[i]);    break;
         case AN_ELLIPSE: DrawEllipseAnnot(hdc, &g_ann[i]); break;
         case AN_ARROW:   DrawArrowAnnot(hdc, &g_ann[i]);   break;
-        case AN_MOSAIC:  DrawMosaicAnnot(hdc, &g_ann[i]);  break;
+        case AN_MOSAIC:  DrawMosaicAnnot(hdc, &g_ann[i], i); break;
         case AN_TEXT:    DrawTextAnnot(hdc, &g_ann[i]);    break;
         case AN_NUMBER:  DrawNumberAnnot(hdc, &g_ann[i]);  break;
         }
@@ -638,11 +788,13 @@ static void DrawAnnotations(HDC hdc)
 }
 
 /* 生成成品位图（bottom-up 32bpp DIB Section），标注一并烘焙进去。
- * *ppBits 返回像素指针，布局正好是 CF_DIB 要的 bottom-up。 */
+ * *ppBits 返回像素指针，布局正好是 CF_DIB 要的 bottom-up。
+ * 任一步失败都会把已建好的资源释放掉并返回 NULL。 */
 static HBITMAP BuildFinalBitmap(int x, int y, int w, int h, void **ppBits)
 {
     if (ppBits) *ppBits = NULL;
     if (w <= 0 || h <= 0 || !g_ov.hdcCap) return NULL;
+    if ((size_t)w > (((size_t)-1) / 4u) / (size_t)h) return NULL;   /* 行字节 * 高度不能溢出 */
 
     BITMAPINFO bi;
     ZeroMemory(&bi, sizeof(bi));
@@ -655,17 +807,25 @@ static HBITMAP BuildFinalBitmap(int x, int y, int w, int h, void **ppBits)
 
     void *bits = NULL;
     HDC hdcScreen = GetDC(NULL);
+    if (!hdcScreen) return NULL;
     HBITMAP hbm = CreateDIBSection(hdcScreen, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
     ReleaseDC(NULL, hdcScreen);
     if (!hbm || !bits) { if (hbm) DeleteObject(hbm); return NULL; }
 
     HDC dc = CreateCompatibleDC(NULL);
-    HGDIOBJ old = SelectObject(dc, hbm);
+    if (!dc) { DeleteObject(hbm); return NULL; }
 
-    BitBlt(dc, 0, 0, w, h, g_ov.hdcCap, x, y, SRCCOPY);
+    HGDIOBJ old = SelectObject(dc, hbm);
+    if (!old || old == (HGDIOBJ)HGDI_ERROR) {
+        DeleteDC(dc);
+        DeleteObject(hbm);
+        return NULL;
+    }
+
+    BOOL ok = BitBlt(dc, 0, 0, w, h, g_ov.hdcCap, x, y, SRCCOPY);
 
     /* 挪视口原点，标注坐标不必逐个减 */
-    if (g_annCount > 0) {
+    if (ok && g_annCount > 0) {
         SetViewportOrgEx(dc, -x, -y, NULL);
         DrawAnnotations(dc);
         SetViewportOrgEx(dc, 0, 0, NULL);
@@ -673,6 +833,10 @@ static HBITMAP BuildFinalBitmap(int x, int y, int w, int h, void **ppBits)
 
     SelectObject(dc, old);
     DeleteDC(dc);
+    if (!ok) {                             /* 底图都没贴成功，返回的位图没有意义 */
+        DeleteObject(hbm);
+        return NULL;
+    }
 
     /* BitBlt 会把 alpha 清零，补回不透明 */
     BYTE *p = (BYTE *)bits;
@@ -683,15 +847,26 @@ static HBITMAP BuildFinalBitmap(int x, int y, int w, int h, void **ppBits)
     return hbm;
 }
 
-static void CopyDibToClipboard(const void *bits, int w, int h)
+/* 把 32bpp bottom-up 像素打包成 CF_DIB 放进剪贴板。
+ * 所有权：只有 SetClipboardData 成功后 hMem 才交给系统，其余失败路径由这里释放。 */
+static BOOL CopyDibToClipboard(const void *bits, int w, int h)
 {
-    if (!bits || w <= 0 || h <= 0) return;
-    DWORD imgSize = (DWORD)w * 4 * (DWORD)h;
+    if (!bits || w <= 0 || h <= 0) return FALSE;
+
+    /* 用 size_t 计算并逐步校验，避免 w*4*h 这类 32 位乘法溢出 */
+    size_t sw = (size_t)w;
+    size_t sh = (size_t)h;
+    size_t stride = sw * 4u;
+    if (stride / 4u != sw) return FALSE;
+    size_t imgSize = stride * sh;
+    if (sh && imgSize / sh != stride) return FALSE;
+    if (imgSize > (size_t)0xFFFFFFFFu - sizeof(BITMAPINFOHEADER)) return FALSE;  /* biSizeImage 是 DWORD */
+    if (imgSize > (size_t)0x7FFFFFFF) return FALSE;                              /* 超过剪贴板可接受范围 */
 
     HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + imgSize);
-    if (!hMem) return;
+    if (!hMem) return FALSE;
     BITMAPINFOHEADER *bih = (BITMAPINFOHEADER *)GlobalLock(hMem);
-    if (!bih) { GlobalFree(hMem); return; }
+    if (!bih) { GlobalFree(hMem); return FALSE; }
 
     ZeroMemory(bih, sizeof(*bih));
     bih->biSize        = sizeof(BITMAPINFOHEADER);
@@ -700,22 +875,30 @@ static void CopyDibToClipboard(const void *bits, int w, int h)
     bih->biPlanes      = 1;
     bih->biBitCount    = 32;
     bih->biCompression = BI_RGB;
-    bih->biSizeImage   = imgSize;
+    bih->biSizeImage   = (DWORD)imgSize;
     memcpy((BYTE *)bih + sizeof(BITMAPINFOHEADER), bits, imgSize);
     GlobalUnlock(hMem);
 
-    if (OpenClipboard(g_hMsgWnd)) {
-        EmptyClipboard();
-        if (!SetClipboardData(CF_DIB, hMem)) GlobalFree(hMem);
+    /* 剪贴板可能被别的程序短暂占用，重试几次再放弃 */
+    BOOL ok = FALSE;
+    for (int attempt = 0; attempt < 5 && !ok; attempt++) {
+        if (!OpenClipboard(g_hMsgWnd)) { Sleep(10); continue; }
+        if (EmptyClipboard()) ok = (SetClipboardData(CF_DIB, hMem) != NULL);
         CloseClipboard();
-    } else {
-        GlobalFree(hMem);
+        if (!ok) Sleep(10);
     }
+
+    if (!ok) {
+        GlobalFree(hMem);
+        QSLog("clipboard: copy %dx%d FAIL err=%lu", w, h, GetLastError());
+    }
+    return ok;
 }
 
 static BOOL SaveBitmapToPng(HBITMAP hbm, const WCHAR *path)
 {
-    if (!hbm) return FALSE;
+    if (!hbm || !path) return FALSE;
+    if (!g_gdiplusOk) return FALSE;         /* GDI+ 没起来就别调 Gdip 接口 */
     BOOL ok = FALSE;
     GpBitmap *bmp = NULL;
     if (GdipCreateBitmapFromHBITMAP(hbm, NULL, &bmp) == 0 && bmp) {
@@ -726,6 +909,39 @@ static BOOL SaveBitmapToPng(HBITMAP hbm, const WCHAR *path)
         GdipDisposeImage((GpImage *)bmp);
     }
     return ok;
+}
+
+/* 生成不重名的截图路径：沿用"截图_年月日_时分秒.png"的风格，
+ * 同一秒重名就追加 _2、_3……，并用 CREATE_NEW 占位，
+ * 绝不会静默覆盖用户已有文件。目录不可写/不存在时返回 FALSE。 */
+static BOOL BuildUniqueShotPath(const WCHAR *dir, WCHAR *out, DWORD cch)
+{
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    WCHAR base[96];
+    wsprintfW(base, L"截图_%04d%02d%02d_%02d%02d%02d",
+              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    for (int n = 1; n <= 999; n++) {
+        WCHAR name[128];
+        if (n == 1) wsprintfW(name, L"%s.png", base);
+        else        wsprintfW(name, L"%s_%d.png", base, n);
+
+        if ((size_t)lstrlenW(dir) + 1 + (size_t)lstrlenW(name) + 1 > (size_t)cch) return FALSE;
+        wsprintfW(out, L"%s\\%s", dir, name);
+
+        HANDLE h = CreateFileW(out, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); return TRUE; }
+
+        DWORD err = GetLastError();
+        if (err != ERROR_FILE_EXISTS && err != ERROR_ALREADY_EXISTS) {
+            QSLog("shot path: %ls -> err=%lu", out, err);
+            return FALSE;                  /* 目录缺失 / 没权限，重试也没用 */
+        }
+    }
+    return FALSE;
 }
 
 /* ---------------------------------------------------------------- 提示气泡 */
@@ -743,8 +959,9 @@ static LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         DeleteObject(b);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(238, 238, 238));
-        SelectObject(dc, g_fontToast);
+        HGDIOBJ oldF = SelectObject(dc, g_fontToast);
         DrawTextW(dc, g_toastText, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(dc, oldF);
         EndPaint(h, &ps);
         return 0;
     }
@@ -766,10 +983,13 @@ static void ToastShowAt(const WCHAR *text, int sx, int sy)
     lstrcpynW(g_toastText, text, 256);
 
     HDC dc = GetDC(NULL);
-    SelectObject(dc, g_fontToast);
     SIZE sz = {0, 0};
-    GetTextExtentPoint32W(dc, g_toastText, lstrlenW(g_toastText), &sz);
-    ReleaseDC(NULL, dc);
+    if (dc) {
+        HGDIOBJ oldF = SelectObject(dc, g_fontToast);
+        GetTextExtentPoint32W(dc, g_toastText, lstrlenW(g_toastText), &sz);
+        SelectObject(dc, oldF);
+        ReleaseDC(NULL, dc);
+    }
 
     int w = sz.cx + 36;
     int h = 34;
@@ -793,7 +1013,7 @@ static void ToastShowAt(const WCHAR *text, int sx, int sy)
     if (!g_toast) return;
 
     HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, 10, 10);
-    if (rgn) SetWindowRgn(g_toast, rgn, TRUE);
+    if (rgn && !SetWindowRgn(g_toast, rgn, TRUE)) DeleteObject(rgn);   /* 设置失败时区域还归我们，要删 */
 
     ShowWindow(g_toast, SW_SHOWNOACTIVATE);
     SetTimer(g_toast, 1, 1500, NULL);
@@ -1490,6 +1710,22 @@ static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 
 static void TextCancel(void);
 
+/* 输入框统一销毁出口：先把控件销毁，再释放它的字体。
+ * WM_SETFONT 只是把句柄存进控件、不会复制字体对象，
+ * 控件还活着的时候 DeleteObject 会让后续绘制/重绘拿到失效句柄。 */
+static void TextEditDestroy(void)
+{
+    if (g_edit) {
+        HWND e = g_edit;
+        g_edit = NULL;
+        DestroyWindow(e);
+    }
+    if (g_editFont) {
+        DeleteObject(g_editFont);
+        g_editFont = NULL;
+    }
+}
+
 static void TextCommit(void)
 {
     if (!g_edit) return;
@@ -1497,9 +1733,7 @@ static void TextCommit(void)
     WCHAR buf[256] = {0};
     GetWindowTextW(g_edit, buf, 256);
 
-    HWND e = g_edit;
-    g_edit = NULL;
-    DestroyWindow(e);
+    TextEditDestroy();                     /* 控件和字体一起收掉 */
     if (g_ov.hwnd) SetFocus(g_ov.hwnd);
 
     int editing = g_editEditing;
@@ -1527,16 +1761,16 @@ static void TextCommit(void)
         g_annCount++;
         QSLog("text commit: %dx%d n=%d", g_editX, g_editY, g_annCount);
     }
+    /* 文字变了 / 下标可能平移，压在上面或下面的马赛克缓存都得作废 */
+    MosaicEpochBump();
     OverlayRedraw();
 }
 
 static void TextCancel(void)
 {
     if (!g_edit) return;
-    HWND e = g_edit;
-    g_edit = NULL;
     g_editEditing = -1;
-    DestroyWindow(e);
+    TextEditDestroy();
     if (g_ov.hwnd) SetFocus(g_ov.hwnd);
     OverlayRedraw();
 }
@@ -1544,17 +1778,21 @@ static void TextCancel(void)
 /* 量出一条文字标注占多大地方，用于判断有没有点到它 */
 static void TextAnnotRect(const Annot *a, RECT *out)
 {
-    HDC dc = GetDC(NULL);
-    HFONT f = CreateFontW(-a->fontH, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0,
-                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-                          L"Microsoft YaHei UI");
-    HGDIOBJ of = SelectObject(dc, f);
     SIZE s = {0, 0};
-    GetTextExtentPoint32W(dc, a->text, lstrlenW(a->text), &s);
-    SelectObject(dc, of);
-    DeleteObject(f);
-    ReleaseDC(NULL, dc);
+    HDC dc = GetDC(NULL);
+    if (dc) {
+        HFONT f = CreateFontW(-a->fontH, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0,
+                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                              L"Microsoft YaHei UI");
+        if (f) {
+            HGDIOBJ of = SelectObject(dc, f);
+            GetTextExtentPoint32W(dc, a->text, lstrlenW(a->text), &s);
+            SelectObject(dc, of);
+            DeleteObject(f);
+        }
+        ReleaseDC(NULL, dc);
+    }
 
     out->left   = a->x;
     out->top    = a->y;
@@ -1591,25 +1829,32 @@ static void TextStart(int x, int y)
     g_editX = x;
     g_editY = y;
 
+    TextEditDestroy();                     /* 保险：上一个输入框连字体一起清掉 */
+
     /* 编辑框的字号跟着当前档位走 */
     HFONT ef = CreateFontW(-fontH, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0,
                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
                            L"Microsoft YaHei UI");
+    if (!ef) {
+        QSLog("TextStart: CreateFont failed");
+        return;
+    }
 
     g_edit = CreateWindowExW(
         0, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | ES_LEFT | ES_AUTOHSCROLL | ES_NOHIDESEL,
         x, y, ew, eh, g_ov.hwnd, (HMENU)(INT_PTR)ID_EDIT, g_hInst, NULL);
     if (!g_edit) {
-        if (ef) DeleteObject(ef);
+        DeleteObject(ef);
         QSLog("TextStart: CreateWindow EDIT failed");
         return;
     }
 
-    /* 用一次性字体；EDIT 内部会自己存一份，销毁后即可释放 */
-    SendMessageW(g_edit, WM_SETFONT, (WPARAM)ef, TRUE);
-    DeleteObject(ef);
+    /* 字体所有权跟着输入框走：WM_SETFONT 不复制字体，控件绘制时还要用这个句柄，
+     * 所以先存到 g_editFont，等 TextEditDestroy 销毁控件之后再释放。 */
+    g_editFont = ef;
+    SendMessageW(g_edit, WM_SETFONT, (WPARAM)g_editFont, TRUE);
 
     g_editOldProc = (WNDPROC)SetWindowLongPtrW(g_edit, GWLP_WNDPROC, (LONG_PTR)EditProc);
     g_editEditing = hitIdx;
@@ -1621,6 +1866,19 @@ static void TextStart(int x, int y)
 
     SetFocus(g_edit);
     QSLog("TextStart at %d,%d editing=%d", x, y, g_editEditing);
+}
+
+/* 遮罩资源统一释放出口：输入框(含字体) → 标注缓存 → 截屏缓冲 → 界面 GDI 对象。
+ * 提交、取消、异常退出、窗口意外销毁都走这里，避免任何一条路径漏放资源。 */
+static void OverlayReleaseAll(void)
+{
+    TextEditDestroy();
+    g_editEditing = -1;
+    g_annCount    = 0;
+    g_numberNext  = 1;
+    MosaicCacheFreeAll();
+    FreeCapture();
+    OverlayGdiFree();
 }
 
 /* ---------------------------------------------------------------- 钉在屏幕上 */
@@ -1652,9 +1910,9 @@ static void PinToast(HWND h, const WCHAR *msg)
 static void PinCopy(HWND h, PinData *pd)
 {
     if (!pd || !pd->bits) return;
-    CopyDibToClipboard(pd->bits, pd->w, pd->h);
-    PinToast(h, L"已复制到剪贴板");
-    QSLog("pin: copy %dx%d", pd->w, pd->h);
+    BOOL ok = CopyDibToClipboard(pd->bits, pd->w, pd->h);
+    PinToast(h, ok ? L"已复制到剪贴板" : L"复制失败，剪贴板可能被其他程序占用");
+    QSLog("pin: copy %dx%d -> %s", pd->w, pd->h, ok ? "ok" : "FAIL");
 }
 
 static void PinSaveAs(HWND h, PinData *pd)
@@ -1803,12 +2061,20 @@ static void CreatePinWindow(HBITMAP hbm, void *bits, int w, int h, int x, int y)
     pd->hdc = CreateCompatibleDC(NULL);
     if (!pd->hdc) { DeleteObject(hbm); free(pd); return; }
     pd->oldBmp = (HBITMAP)SelectObject(pd->hdc, hbm);
+    if (!pd->oldBmp || pd->oldBmp == (HBITMAP)HGDI_ERROR) {
+        pd->oldBmp = NULL;
+        DeleteDC(pd->hdc);
+        DeleteObject(hbm);
+        free(pd);
+        return;
+    }
 
     HWND hw = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         PIN_CLASS, L"", WS_POPUP,
         x, y, w, h, NULL, NULL, g_hInst, pd);
     if (!hw) {
+        SelectObject(pd->hdc, pd->oldBmp);     /* 先选回原位图，位图才能删掉 */
         DeleteDC(pd->hdc);
         DeleteObject(pd->hbm);
         free(pd);
@@ -1867,29 +2133,34 @@ static void OverlayFinish(void)
     g_ov.hasSel = FALSE;      /* 别再把选框画进去 */
     if (g_ov.hwnd) ShowWindow(g_ov.hwnd, SW_HIDE);
 
-    BOOL saved = FALSE;
+    BOOL copied = FALSE, saved = FALSE;
     WCHAR msg[512];
 
     if (hbm && bits) {
-        CopyDibToClipboard(bits, w, h);
+        copied = CopyDibToClipboard(bits, w, h);
 
         if (g_saveFile) {
-            WCHAR name[128], full[MAX_PATH * 2];
-            SYSTEMTIME st;
-            GetLocalTime(&st);
-            wsprintfW(name, L"截图_%04d%02d%02d_%02d%02d%02d.png",
-                      st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-            lstrcpynW(full, g_saveDir, MAX_PATH);
-            lstrcatW(full, L"\\");
-            lstrcatW(full, name);
-            saved = SaveBitmapToPng(hbm, full);
+            WCHAR full[MAX_PATH * 2];
+            /* 唯一命名 + CREATE_NEW 占位：同一秒连拍不会重名，也不会覆盖已有截图 */
+            if (BuildUniqueShotPath(g_saveDir, full, (DWORD)(sizeof(full) / sizeof(full[0])))) {
+                saved = SaveBitmapToPng(hbm, full);
+                if (!saved) DeleteFileW(full);   /* 别留下 0 字节的残文件 */
+                QSLog("OverlayFinish: save %s -> %ls", saved ? "ok" : "FAIL", full);
+            } else {
+                QSLog("OverlayFinish: save path FAIL dir=%ls", g_saveDir);
+            }
         }
+    } else {
+        QSLog("OverlayFinish: BuildFinalBitmap FAIL");
     }
     if (hbm) DeleteObject(hbm);
 
     if (!g_toast) {
-        if (saved) lstrcpynW(msg, L"已复制  ·  已保存到 Screenshots", 512);
-        else       lstrcpynW(msg, L"已复制到剪贴板", 512);
+        if (copied && saved)             lstrcpynW(msg, L"已复制  ·  已保存到 Screenshots", 512);
+        else if (copied && !g_saveFile)  lstrcpynW(msg, L"已复制到剪贴板", 512);
+        else if (copied)                 lstrcpynW(msg, L"已复制 · 保存失败，请检查保存目录", 512);
+        else if (saved)                  lstrcpynW(msg, L"已保存，但复制到剪贴板失败", 512);
+        else                             lstrcpynW(msg, L"复制和保存都失败了", 512);
         ToastShowAt(msg,
                     g_ov.vx + x1 + w / 2,
                     g_ov.vy + y1 + h + 12);
@@ -1905,6 +2176,7 @@ static void UndoOne(void)
     if (g_ann[g_annCount - 1].kind == AN_NUMBER && g_numberNext > 1)
         g_numberNext--;
     g_annCount--;
+    MosaicEpochBump();                     /* 标注少了一条，缓存下标可能对不上，整体作废 */
     QSLog("overlay: undo -> %d left, next number=%d", g_annCount, g_numberNext);
     OverlayRedraw();
 }
@@ -2120,6 +2392,7 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
                 g_ov.hasSel = TRUE;
                 g_ov.sel    = RectNorm(x, y, x, y);
                 g_annCount  = 0;               /* 重新框选，清掉旧标注 */
+                MosaicEpochBump();             /* 标注全清，马赛克缓存一并作废 */
                 QSLog("overlay: new selection (clicked outside)");
             }
         } else {
@@ -2127,6 +2400,7 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             g_ov.hasSel = TRUE;
             g_ov.sel    = RectNorm(x, y, x, y);
             g_annCount  = 0;
+            MosaicEpochBump();
         }
 
         SetCapture(h);
@@ -2259,17 +2533,16 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     case WM_OV_CLOSE:
         QSLog("overlay WM_OV_CLOSE");
         if (GetCapture() == h) ReleaseCapture();
-        if (g_edit) { HWND e = g_edit; g_edit = NULL; DestroyWindow(e); }
-        g_annCount = 0;
-        FreeCapture();
-        OverlayGdiFree();
+        OverlayReleaseAll();
         g_ov.hwnd = NULL;
         DestroyWindow(h);
         return 0;
 
     case WM_DESTROY:
-        if (g_ov.hwnd == h) g_ov.hwnd = NULL;
-        FreeCapture();
+        if (g_ov.hwnd == h) {
+            g_ov.hwnd = NULL;
+            OverlayReleaseAll();           /* 兜底：就算没走 WM_OV_CLOSE 也不漏资源 */
+        }
         return 0;
     }
     return DefWindowProcW(h, m, wp, lp);
@@ -2329,14 +2602,47 @@ static void StartCapture(void)
 
 /* ---------------------------------------------------------------- 托盘 / 菜单 */
 
-static void RegisterHotkeyNow(void)
+/* 注销当前生效的热键（退出时用） */
+static void HotkeyUnregisterActive(void)
 {
-    if (g_hotkeyOk) {
-        UnregisterHotKey(g_hMsgWnd, HOTKEY_ID);
-        g_hotkeyOk = FALSE;
+    if (g_hotkeyId) {
+        UnregisterHotKey(g_hMsgWnd, g_hotkeyId);
+        g_hotkeyId = 0;
     }
-    g_hotkeyOk = RegisterHotKey(g_hMsgWnd, HOTKEY_ID,
-                                g_mods | MOD_NOREPEAT, g_vk);
+    g_hotkeyOk = FALSE;
+}
+
+/* 切换全局热键：先注册新组合，成功后才注销旧组合。
+ *
+ * 原来的做法是先注销旧的再试新的，新组合被别的程序占用时就会出现
+ * “旧热键已经没了、新热键也没注册上、注册表却写了新值”的三输局面。
+ * 这里反过来：新组合注册成功之前不动旧组合，失败就直接原样返回，
+ * 调用方也只在成功后才写注册表，保证运行状态和持久化配置一致。
+ *
+ * 两个 ID 轮换（HOTKEY_ID / HOTKEY_ID_ALT）的原因：
+ * 同一个 ID 无法同时持有新旧两个组合，而新组合没拿到之前又不能放开旧组合，
+ * 所以新组合先挂在另一个 ID 上，拿到手之后再注销旧 ID。 */
+static BOOL HotkeyTryApply(UINT mods, UINT vk)
+{
+    if (g_hotkeyOk && mods == g_mods && vk == g_vk) return TRUE;   /* 没变化，不重复注册 */
+    if (!g_hMsgWnd) return FALSE;
+
+    UINT newId = (g_hotkeyId == HOTKEY_ID) ? HOTKEY_ID_ALT : HOTKEY_ID;
+    if (!RegisterHotKey(g_hMsgWnd, newId, mods | MOD_NOREPEAT, vk)) {
+        QSLog("hotkey: register 0x%X/0x%X FAIL err=%lu (old kept)",
+              mods, vk, GetLastError());
+        return FALSE;                  /* 旧热键仍然有效，g_mods/g_vk 不变 */
+    }
+
+    /* 新组合已经到手，这时放开旧的才是安全的 */
+    if (g_hotkeyId && g_hotkeyId != newId) UnregisterHotKey(g_hMsgWnd, g_hotkeyId);
+
+    g_hotkeyId = newId;
+    g_hotkeyOk = TRUE;
+    g_mods     = mods;
+    g_vk       = vk;
+    QSLog("hotkey: applied 0x%X/0x%X id=0x%X", mods, vk, newId);
+    return TRUE;
 }
 
 static void ShowTrayMenu(void)
@@ -2405,7 +2711,7 @@ static LRESULT CALLBACK MsgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 
     case WM_HOTKEY:
         QSLog("WM_HOTKEY id=0x%X", (unsigned)LOWORD(wp));
-        if (LOWORD(wp) == HOTKEY_ID) StartCapture();
+        if (g_hotkeyId && LOWORD(wp) == g_hotkeyId) StartCapture();
         return 0;
 
     case WM_COMMAND: {
@@ -2423,14 +2729,14 @@ static LRESULT CALLBACK MsgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             DestroyWindow(h);
         } else if (id >= MENU_HK_BASE && id < MENU_HK_BASE + PRESET_COUNT) {
             int idx = (int)(id - MENU_HK_BASE);
-            g_mods = g_presets[idx].mods;
-            g_vk   = g_presets[idx].vk;
-            SaveSettingDword(L"HotMods", g_mods);
-            SaveSettingDword(L"HotVk", g_vk);
-            RegisterHotkeyNow();
-            if (!g_hotkeyOk) {
+            /* 只有新热键真的注册成功，才更新内存配置并落盘；
+             * 失败时旧热键和旧配置都保持原样。 */
+            if (HotkeyTryApply(g_presets[idx].mods, g_presets[idx].vk)) {
+                SaveSettingDword(L"HotMods", g_mods);
+                SaveSettingDword(L"HotVk", g_vk);
+            } else {
                 MessageBoxW(NULL,
-                            L"该快捷键已被其他程序占用，请换一个。",
+                            L"该快捷键已被其他程序占用，请换一个。\n\n原快捷键保持不变。",
                             L"QuickShot", MB_ICONWARNING | MB_OK);
             }
         }
@@ -2468,12 +2774,18 @@ static int RunDemoShot(const WCHAR *bgPath, const WCHAR *outPath, BOOL showAll)
     g_ov.vw = (int)iw;
     g_ov.vh = (int)ih;
 
-    if (!OvAllocBuffers(g_ov.vw, g_ov.vh)) { GdipDisposeImage((GpImage *)bmp); return 1; }
+    if (!OvAllocBuffers(g_ov.vw, g_ov.vh)) {
+        GdipDisposeImage((GpImage *)bmp);
+        OverlayGdiFree();
+        return 1;
+    }
 
     /* 把图铺进"截图"缓冲 */
     GpGraphics *gp = NULL;
     if (GdipCreateFromHDC(g_ov.hdcCap, &gp) != 0 || !gp) {
         GdipDisposeImage((GpImage *)bmp);
+        FreeCapture();
+        OverlayGdiFree();
         return 1;
     }
     GdipSetCompositingMode(gp, CompositingModeSourceCopy);
@@ -2555,12 +2867,26 @@ static int RunDemoShot(const WCHAR *bgPath, const WCHAR *outPath, BOOL showAll)
 
     void *obits = NULL;
     HDC sdc = GetDC(NULL);
+    if (!sdc) { FreeCapture(); OverlayGdiFree(); return 1; }
     HBITMAP out = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &obits, NULL, 0);
     ReleaseDC(NULL, sdc);
-    if (!out || !obits) { FreeCapture(); return 1; }
+    if (!out || !obits) {
+        if (out) DeleteObject(out);
+        FreeCapture();
+        OverlayGdiFree();
+        return 1;
+    }
 
     HDC odc = CreateCompatibleDC(NULL);
+    if (!odc) { DeleteObject(out); FreeCapture(); OverlayGdiFree(); return 1; }
     HGDIOBJ old = SelectObject(odc, out);
+    if (!old || old == (HGDIOBJ)HGDI_ERROR) {
+        DeleteDC(odc);
+        DeleteObject(out);
+        FreeCapture();
+        OverlayGdiFree();
+        return 1;
+    }
     OverlayDraw(odc);
     SelectObject(odc, old);
     DeleteDC(odc);
@@ -2802,6 +3128,546 @@ static int RunToolbarTest(void)
     return (ok && bad == 0 && curBad == 0) ? 0 : 1;
 }
 
+/* ---------------------------------------------------------------- 稳定性自检 */
+
+/* 用 --stress-test 触发：覆盖连续截图、文字编辑、马赛克、剪贴板、
+ * 文件命名、快捷键冲突和退出清理，并对比操作前后的 GDI 对象数量。 */
+
+static int g_testFail = 0;
+
+static void TestCheck(BOOL ok, const char *what)
+{
+    printf("[%s] %s\n", ok ? "PASS" : "FAIL", what);
+    fflush(stdout);
+    if (!ok) g_testFail++;
+}
+
+static DWORD GdiCount(void)
+{
+    return GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+}
+
+static COLORREF TopDownPixel(const void *bits, int w, int x, int y)
+{
+    const BYTE *p = (const BYTE *)bits + ((size_t)y * (size_t)w + (size_t)x) * 4;
+    return RGB(p[2], p[1], p[0]);
+}
+
+static COLORREF BottomUpPixel(const void *bits, int w, int h, int x, int y)
+{
+    const BYTE *p = (const BYTE *)bits + ((size_t)(h - 1 - y) * (size_t)w + (size_t)x) * 4;
+    return RGB(p[2], p[1], p[0]);
+}
+
+/* 离屏渲染一份"遮罩预览"，像素布局和 g_ov 的 top-down 缓冲一致 */
+static HBITMAP RenderOverlayToDib(void **ppBits)
+{
+    if (ppBits) *ppBits = NULL;
+
+    BITMAPINFO bi;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = g_ov.vw;
+    bi.bmiHeader.biHeight      = -g_ov.vh;
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    void *bits = NULL;
+    HBITMAP hbm = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!hbm || !bits) { if (hbm) DeleteObject(hbm); return NULL; }
+
+    HDC dc = CreateCompatibleDC(NULL);
+    if (!dc) { DeleteObject(hbm); return NULL; }
+
+    HGDIOBJ old = SelectObject(dc, hbm);
+    if (!old || old == (HGDIOBJ)HGDI_ERROR) {
+        DeleteDC(dc);
+        DeleteObject(hbm);
+        return NULL;
+    }
+    OverlayDraw(dc);
+    SelectObject(dc, old);
+    DeleteDC(dc);
+
+    if (ppBits) *ppBits = bits;
+    return hbm;
+}
+
+static void TestCaptureLoop(void)
+{
+    DWORD g0 = GdiCount();
+    int fails = 0;
+    ULONGLONG t0 = GetTickCount64();
+    for (int i = 0; i < 1000; i++) {
+        if (!CaptureVirtualScreen()) fails++;
+        FreeCapture();
+    }
+    ULONGLONG dt = GetTickCount64() - t0;
+    DWORD g1 = GdiCount();
+    printf("capture: 1000x %llu ms, gdi %lu -> %lu, fails=%d\n",
+           (unsigned long long)dt, g0, g1, fails);
+    TestCheck(fails == 0, "capture 1000 times");
+    TestCheck(g1 <= g0 + 4, "capture loop gdi stable");
+}
+
+static void TestTextLifecycle(HWND parent)
+{
+    g_ov.hwnd = parent;
+    g_ov.vx = 0; g_ov.vy = 0;
+    g_ov.vw = 640; g_ov.vh = 480;
+    g_ov.hasSel = TRUE;
+    g_ov.state = ST_IDLE;
+    g_ov.sel.left = 0; g_ov.sel.top = 0;
+    g_ov.sel.right = 640; g_ov.sel.bottom = 480;
+
+    if (!OvAllocBuffers(g_ov.vw, g_ov.vh)) { TestCheck(FALSE, "text: alloc buffers"); return; }
+
+    /* 预热：EDIT 控件第一次创建时系统会分配一次性的 GDI 缓存，
+     * 预热之后再看增量，才能区分"一次性缓存"和"每次泄漏" */
+    for (int i = 0; i < 50; i++) {
+        g_annCount = 0;
+        TextStart(20, 20);
+        TextCancel();
+    }
+
+    DWORD g0 = GdiCount();
+    int fails = 0;
+    for (int i = 0; i < 1000; i++) {
+        g_annCount = 0;
+        TextStart(20 + (i % 40), 20 + (i % 30));
+        if (!g_edit) { fails++; continue; }
+        if (i % 3 == 0) {
+            SetWindowTextW(g_edit, L"文本标注");
+            TextCommit();
+        } else {
+            TextCancel();
+        }
+        if (g_edit || g_editFont) fails++;    /* 提交/取消后不能残留 */
+    }
+    g_annCount = 0;
+    DWORD g1 = GdiCount();
+    printf("text: 1000x commit/cancel, gdi %lu -> %lu, fails=%d\n", g0, g1, fails);
+    TestCheck(fails == 0, "text create/commit/cancel 1000x");
+    TestCheck(g1 <= g0 + 2, "text loop gdi stable");
+
+    /* 编辑状态下直接退出：控件和字体都要回收 */
+    TextStart(30, 30);
+    BOOL hadEdit = (g_edit != NULL);
+    OverlayReleaseAll();
+    TestCheck(hadEdit && !g_edit && !g_editFont, "teardown with editor open");
+    g_ov.hwnd = NULL;
+}
+
+static void FillTestPattern(void)
+{
+    BYTE *p = (BYTE *)g_ov.pixCap;
+    if (!p) return;
+    for (int y = 0; y < g_ov.vh; y++) {
+        for (int x = 0; x < g_ov.vw; x++) {
+            BYTE *q = p + ((size_t)y * (size_t)g_ov.vw + (size_t)x) * 4;
+            q[0] = (BYTE)(x * 255 / g_ov.vw);
+            q[1] = (BYTE)(y * 255 / g_ov.vh);
+            q[2] = (BYTE)((x + y) & 0xFF);
+            q[3] = 255;
+        }
+    }
+}
+
+static void TestMosaic(HWND parent)
+{
+    g_ov.hwnd = parent;
+    g_ov.vx = 0; g_ov.vy = 0;
+    g_ov.vw = 640; g_ov.vh = 480;
+    g_ov.hasSel = TRUE;
+    g_ov.state = ST_SELECTED;
+    g_ov.sel.left = 10;  g_ov.sel.top = 10;
+    g_ov.sel.right = 620; g_ov.sel.bottom = 400;
+    g_tool = TOOL_MOVE;
+
+    if (!OvAllocBuffers(g_ov.vw, g_ov.vh)) { TestCheck(FALSE, "mosaic: alloc buffers"); return; }
+    FillTestPattern();
+    OvDimBuffers();
+    MosaicEpochBump();
+
+    /* 三条马赛克，都避开右下角工具条 */
+    static const RECT rects[3] = {
+        {  40,  40, 180, 140 },
+        { 200,  40, 320, 120 },
+        { 360,  40, 480, 140 },
+    };
+    g_annCount = 0;
+    for (int i = 0; i < 3; i++) {
+        Annot *a = &g_ann[g_annCount++];
+        ZeroMemory(a, sizeof(*a));
+        a->kind = AN_MOSAIC;
+        a->rc   = rects[i];
+    }
+
+    /* 1) 有缓存：重复重绘应该很便宜。先预热一次把缓存建起来，
+     *    这样后面测到的增量只是"每次重绘额外创建"的对象。 */
+    HBITMAP prv = RenderOverlayToDib(NULL);
+    void   *pbits = NULL;
+    if (prv) { DeleteObject(prv); prv = NULL; }
+    prv = RenderOverlayToDib(&pbits);
+
+    DWORD g0 = GdiCount();
+    for (int i = 0; i < 300; i++) {
+        if (prv) { DeleteObject(prv); prv = NULL; }
+        prv = RenderOverlayToDib(&pbits);
+    }
+    DWORD g1 = GdiCount();
+    TestCheck(prv != NULL, "mosaic 300 redraws render");
+    TestCheck(g1 <= g0 + 2, "mosaic redraw gdi stable");
+
+    /* 2) 只对标注绘制做微基准：整窗拷贝会淹没马赛克自身的开销。
+     *    先测缓存命中，再强制每帧重算作为缓存前的基线。 */
+    BITMAPINFO dbi;
+    ZeroMemory(&dbi, sizeof(dbi));
+    dbi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    dbi.bmiHeader.biWidth       = g_ov.vw;
+    dbi.bmiHeader.biHeight      = -g_ov.vh;
+    dbi.bmiHeader.biPlanes      = 1;
+    dbi.bmiHeader.biBitCount    = 32;
+    dbi.bmiHeader.biCompression = BI_RGB;
+
+    void   *dbits = NULL;
+    HBITMAP dhbm = CreateDIBSection(NULL, &dbi, DIB_RGB_COLORS, &dbits, NULL, 0);
+    HDC     ddc  = dhbm ? CreateCompatibleDC(NULL) : NULL;
+    HGDIOBJ dold = ddc ? SelectObject(ddc, dhbm) : NULL;
+
+    ULONGLONG dtCached = 0, dtDirect = 0;
+    if (ddc && dold && dold != (HGDIOBJ)HGDI_ERROR) {
+        DrawAnnotations(ddc);                       /* 先建缓存 */
+        ULONGLONG t0 = GetTickCount64();
+        for (int i = 0; i < 500; i++) DrawAnnotations(ddc);
+        dtCached = GetTickCount64() - t0;
+
+        ULONGLONG t1 = GetTickCount64();
+        for (int i = 0; i < 500; i++) {
+            MosaicEpochBump();
+            DrawAnnotations(ddc);
+        }
+        dtDirect = GetTickCount64() - t1;
+
+        SelectObject(ddc, dold);
+        DeleteDC(ddc);
+    }
+    if (dhbm) DeleteObject(dhbm);
+    printf("mosaic: annots 500x cached %llu ms, 500x uncached %llu ms\n",
+           (unsigned long long)dtCached, (unsigned long long)dtDirect);
+    TestCheck(dtCached <= dtDirect, "mosaic cache is not slower than recompute");
+
+    /* 3) 预览和导出结果必须一致：重新走一次无缓存的导出，和缓存预览逐点比较 */
+    int sw = g_ov.sel.right - g_ov.sel.left;
+    int sh = g_ov.sel.bottom - g_ov.sel.top;
+    void *ebits = NULL;
+    MosaicEpochBump();                     /* 让导出路径自己重算 */
+    HBITMAP exp = BuildFinalBitmap(g_ov.sel.left, g_ov.sel.top, sw, sh, &ebits);
+    int mismatch = 0, samples = 0;
+    if (exp && ebits && prv && pbits) {
+        static const POINT pts[] = {
+            {  60,  60 }, { 120, 110 }, { 210,  60 },
+            { 300, 110 }, { 400,  70 }, { 470, 130 }
+        };
+        for (int i = 0; i < (int)(sizeof(pts) / sizeof(pts[0])); i++) {
+            COLORREF pv = TopDownPixel(pbits, g_ov.vw, pts[i].x, pts[i].y);
+            COLORREF ex = BottomUpPixel(ebits, sw, sh,
+                                        pts[i].x - g_ov.sel.left,
+                                        pts[i].y - g_ov.sel.top);
+            samples++;
+            if (pv != ex) mismatch++;
+        }
+    }
+    printf("mosaic: preview vs export %d/%d match\n", samples - mismatch, samples);
+    TestCheck(exp && ebits && samples == 6 && mismatch == 0, "mosaic preview == export");
+    if (exp) DeleteObject(exp);
+
+    /* 4) 撤销最后一条马赛克，原区域要还原成底图 */
+    UndoOne();
+    void *pbits2 = NULL;
+    HBITMAP prv2 = RenderOverlayToDib(&pbits2);
+    COLORREF after = 0, base = 0;
+    if (prv2 && pbits2 && g_ov.pixCap) {
+        after = TopDownPixel(pbits2, g_ov.vw, 400, 70);
+        base  = TopDownPixel(g_ov.pixCap, g_ov.vw, 400, 70);
+    }
+    TestCheck(prv2 && after == base, "mosaic undo restores base pixels");
+    if (prv)  DeleteObject(prv);
+    if (prv2) DeleteObject(prv2);
+
+    g_annCount = 0;
+    FreeCapture();
+    g_ov.hwnd = NULL;
+}
+
+static void TestClipboard(void)
+{
+    int w = 64, h = 48;
+    BYTE *bits = (BYTE *)calloc((size_t)w * h * 4, 1);
+    if (!bits) { TestCheck(FALSE, "clipboard: alloc"); return; }
+
+    TestCheck(CopyDibToClipboard(bits, w, h), "clipboard copy 64x48");
+    TestCheck(!CopyDibToClipboard(bits, 0, 10), "clipboard rejects w=0");
+    TestCheck(!CopyDibToClipboard(bits, -4, 10), "clipboard rejects w<0");
+    TestCheck(!CopyDibToClipboard(bits, 1 << 20, 1 << 20), "clipboard rejects huge size");
+    TestCheck(!CopyDibToClipboard(NULL, 10, 10), "clipboard rejects NULL bits");
+
+    free(bits);
+}
+
+/* 另一个线程占住剪贴板，模拟"剪贴板被其他程序占用" */
+static HANDLE g_clipHold, g_clipRelease;
+static volatile LONG g_clipHeld = 0;
+
+static DWORD WINAPI ClipboardBlockerThread(LPVOID unused)
+{
+    (void)unused;
+    if (OpenClipboard(NULL)) {
+        InterlockedExchange(&g_clipHeld, 1);
+        SetEvent(g_clipHold);
+        WaitForSingleObject(g_clipRelease, INFINITE);
+        CloseClipboard();
+    } else {
+        SetEvent(g_clipHold);
+    }
+    return 0;
+}
+
+static void TestClipboardBusy(void)
+{
+    g_clipHold    = CreateEventW(NULL, TRUE, FALSE, NULL);
+    g_clipRelease = CreateEventW(NULL, TRUE, FALSE, NULL);
+    InterlockedExchange(&g_clipHeld, 0);
+
+    HANDLE th = CreateThread(NULL, 0, ClipboardBlockerThread, NULL, 0, NULL);
+    if (!th || !g_clipHold || !g_clipRelease) {
+        if (th) CloseHandle(th);
+        if (g_clipHold) CloseHandle(g_clipHold);
+        if (g_clipRelease) CloseHandle(g_clipRelease);
+        g_clipHold = g_clipRelease = NULL;
+        TestCheck(FALSE, "clipboard busy: setup");
+        return;
+    }
+    WaitForSingleObject(g_clipHold, 3000);
+
+    if (InterlockedCompareExchange(&g_clipHeld, 1, 1) == 1) {
+        BYTE *bits = (BYTE *)calloc(32 * 32 * 4, 1);
+        BOOL ok = CopyDibToClipboard(bits, 32, 32);
+        free(bits);
+        TestCheck(!ok, "clipboard busy: copy fails safely");
+    } else {
+        printf("[SKIP] clipboard busy: OpenClipboard failed in helper thread\n");
+    }
+
+    SetEvent(g_clipRelease);
+    WaitForSingleObject(th, 3000);
+    CloseHandle(th);
+    CloseHandle(g_clipHold);
+    CloseHandle(g_clipRelease);
+    g_clipHold = g_clipRelease = NULL;
+}
+
+static void TestFileNames(void)
+{
+    WCHAR dir[MAX_PATH];
+    DWORD n = GetTempPathW(MAX_PATH, dir);
+    if (!n || n >= MAX_PATH) { TestCheck(FALSE, "temp path"); return; }
+    lstrcatW(dir, L"qs_stab_test");
+    RemoveDirectoryW(dir);
+    if (!CreateDirectoryW(dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        TestCheck(FALSE, "create temp dir");
+        return;
+    }
+
+    static WCHAR names[20][MAX_PATH * 2];
+    int made = 0, dup = 0;
+    for (int i = 0; i < 20; i++) {
+        if (!BuildUniqueShotPath(dir, names[i], MAX_PATH * 2)) break;
+        for (int j = 0; j < i; j++) if (!wcscmp(names[j], names[i])) dup++;
+        made++;
+    }
+    printf("files: made=%d dup=%d\n", made, dup);
+    TestCheck(made == 20, "20 shots in one second get unique names");
+    TestCheck(dup == 0, "no duplicate file names");
+
+    /* 已有文件不能被覆盖：再要一个名字必须和之前那 20 个都不同 */
+    WCHAR again[MAX_PATH * 2];
+    BOOL okAgain = BuildUniqueShotPath(dir, again, MAX_PATH * 2);
+    int same = 0;
+    if (okAgain) for (int i = 0; i < made; i++) if (!wcscmp(again, names[i])) same++;
+    TestCheck(okAgain && same == 0, "existing files are not overwritten");
+    if (okAgain) DeleteFileW(again);
+
+    for (int i = 0; i < made; i++) DeleteFileW(names[i]);
+
+    /* 目录不存在 / 不可写时必须安全失败 */
+    WCHAR missing[MAX_PATH], p[MAX_PATH * 2];
+    wsprintfW(missing, L"%s\\no_such_sub_dir", dir);
+    TestCheck(!BuildUniqueShotPath(missing, p, MAX_PATH * 2), "missing dir rejected");
+
+    RemoveDirectoryW(dir);
+}
+
+/* 用另一个线程占住 Ctrl+Alt+S，模拟"被其他程序占用" */
+static HANDLE g_hkReady, g_hkRelease, g_hkThread;
+static volatile LONG g_hkBlocked = 0;
+
+static DWORD WINAPI HotkeyBlockerThread(LPVOID unused)
+{
+    (void)unused;
+    HWND w = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 0, 0,
+                             HWND_MESSAGE, NULL, NULL, NULL);
+    if (w && RegisterHotKey(w, 0xBEEF, MOD_CONTROL | MOD_ALT, 'S')) {
+        InterlockedExchange(&g_hkBlocked, 1);
+        SetEvent(g_hkReady);
+        WaitForSingleObject(g_hkRelease, INFINITE);
+        UnregisterHotKey(w, 0xBEEF);
+    } else {
+        SetEvent(g_hkReady);           /* 没占上，主线程会跳过这个用例 */
+    }
+    if (w) DestroyWindow(w);
+    return 0;
+}
+
+static void TestHotkey(void)
+{
+    g_hotkeyId = 0;
+    g_hotkeyOk = FALSE;
+    g_mods = MOD_CONTROL | MOD_ALT;
+    g_vk   = 'A';
+
+    if (!HotkeyTryApply(MOD_CONTROL | MOD_ALT, 'A')) {
+        TestCheck(FALSE, "hotkey: initial register Ctrl+Alt+A");
+        return;
+    }
+    UINT idBefore = g_hotkeyId;
+    int aM = MOD_CONTROL | MOD_ALT, aV = 'A';
+
+    g_hkReady   = CreateEventW(NULL, TRUE, FALSE, NULL);
+    g_hkRelease = CreateEventW(NULL, TRUE, FALSE, NULL);
+    InterlockedExchange(&g_hkBlocked, 0);
+    g_hkThread  = CreateThread(NULL, 0, HotkeyBlockerThread, NULL, 0, NULL);
+    if (!g_hkReady || !g_hkRelease || !g_hkThread) {
+        TestCheck(FALSE, "hotkey: blocker thread");
+        HotkeyUnregisterActive();
+        return;
+    }
+    WaitForSingleObject(g_hkReady, 3000);
+
+    if (InterlockedCompareExchange(&g_hkBlocked, 1, 1) == 1) {
+        /* 新组合被占用：必须失败，且旧热键、旧配置都不能动 */
+        BOOL switched = HotkeyTryApply(MOD_CONTROL | MOD_ALT, 'S');
+        TestCheck(!switched, "occupied hotkey rejected");
+        TestCheck(g_mods == (UINT)aM && g_vk == (UINT)aV && g_hotkeyId == idBefore,
+                  "old hotkey kept after failed switch");
+
+        TestCheck(HotkeyTryApply(MOD_CONTROL | MOD_SHIFT, 'A'), "switch to free hotkey works");
+
+        SetEvent(g_hkRelease);
+        WaitForSingleObject(g_hkThread, 3000);
+        CloseHandle(g_hkThread);
+        CloseHandle(g_hkReady);
+        CloseHandle(g_hkRelease);
+        g_hkThread = NULL; g_hkReady = g_hkRelease = NULL;
+
+        TestCheck(HotkeyTryApply(MOD_CONTROL | MOD_ALT, 'S'), "released combo can be applied");
+    } else {
+        printf("[SKIP] hotkey conflict: Ctrl+Alt+S already taken by another app\n");
+        SetEvent(g_hkRelease);
+        WaitForSingleObject(g_hkThread, 3000);
+        CloseHandle(g_hkThread);
+        CloseHandle(g_hkReady);
+        CloseHandle(g_hkRelease);
+        g_hkThread = NULL; g_hkReady = g_hkRelease = NULL;
+    }
+
+    HotkeyUnregisterActive();
+    TestCheck(!g_hotkeyOk && g_hotkeyId == 0, "hotkey unregistered");
+}
+
+/* 预热：先把各子系统的一次性系统缓存（EDIT 控件内部对象、GDI+ 全局对象等）
+ * 建出来，再测整个流程前后的 GDI 数量，避免把一次性缓存误判成泄漏。 */
+static void WarmUpAll(HWND overlay)
+{
+    g_ov.hwnd = overlay;
+    g_ov.vx = 0; g_ov.vy = 0;
+    g_ov.vw = 640; g_ov.vh = 480;
+    g_ov.hasSel = TRUE;
+    g_ov.state = ST_SELECTED;
+    g_ov.sel.left = 10;  g_ov.sel.top = 10;
+    g_ov.sel.right = 620; g_ov.sel.bottom = 400;
+
+    if (!OvAllocBuffers(g_ov.vw, g_ov.vh)) { g_ov.hwnd = NULL; return; }
+    FillTestPattern();
+    OvDimBuffers();
+
+    g_annCount = 0;
+    Annot *a = &g_ann[g_annCount++];
+    ZeroMemory(a, sizeof(*a));
+    a->kind = AN_MOSAIC;
+    a->rc.left = 40; a->rc.top = 40; a->rc.right = 180; a->rc.bottom = 140;
+
+    HBITMAP h = RenderOverlayToDib(NULL);
+    if (h) DeleteObject(h);
+
+    for (int i = 0; i < 20; i++) {
+        TextStart(30, 30);
+        TextCancel();
+    }
+
+    void *bits = NULL;
+    HBITMAP hb = BuildFinalBitmap(10, 10, 200, 150, &bits);
+    if (hb && bits) CopyDibToClipboard(bits, 200, 150);
+    if (hb) DeleteObject(hb);
+
+    g_annCount = 0;
+    OverlayReleaseAll();
+    g_ov.hwnd = NULL;
+}
+
+static int RunStabilityTest(void)
+{
+    printf("=== QuickShot stability self-test ===\n");
+
+    g_hMsgWnd = CreateWindowExW(0, L"QS_MsgWnd", L"", 0, 0, 0, 0, 0,
+                                NULL, NULL, g_hInst, NULL);
+    if (!g_hMsgWnd) { printf("FAIL: message window\n"); return 1; }
+
+    HWND overlay = CreateWindowExW(WS_EX_TOOLWINDOW, OVERLAY_CLASS, L"", WS_POPUP,
+                                   0, 0, 640, 480, NULL, NULL, g_hInst, NULL);
+    if (!overlay) { printf("FAIL: overlay window\n"); DestroyWindow(g_hMsgWnd); return 1; }
+
+    WarmUpAll(overlay);
+    DWORD g0 = GdiCount();
+
+    TestCaptureLoop();
+    printf("  gdi after capture: %lu\n", GdiCount());
+    TestTextLifecycle(overlay);
+    printf("  gdi after text: %lu\n", GdiCount());
+    TestMosaic(overlay);
+    printf("  gdi after mosaic: %lu\n", GdiCount());
+    TestClipboard();
+    TestClipboardBusy();
+    TestFileNames();
+    TestHotkey();
+
+    /* 模拟一次正常退出：窗口销毁 + 资源统一释放 */
+    if (g_ov.hwnd == overlay) g_ov.hwnd = NULL;
+    DestroyWindow(overlay);
+    DestroyWindow(g_hMsgWnd);
+    g_hMsgWnd = NULL;
+    OverlayReleaseAll();
+
+    DWORD g1 = GdiCount();
+    printf("=== gdi total: %lu -> %lu ===\n", g0, g1);
+    TestCheck(g1 <= g0, "no gdi leak across whole run");
+
+    printf("=== %s (%d failures) ===\n", g_testFail ? "FAILED" : "OK", g_testFail);
+    fflush(stdout);
+    return g_testFail ? 1 : 0;
+}
+
 /* ---------------------------------------------------------------- 入口 */
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
@@ -2825,6 +3691,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
     /* 单实例（自检模式跳过，免得被正在运行的实例挡掉） */
     BOOL isTest = (wcsstr(GetCommandLineW(), L"--capture-test") != NULL ||
                    wcsstr(GetCommandLineW(), L"--toolbar-test") != NULL ||
+                   wcsstr(GetCommandLineW(), L"--stress-test") != NULL ||
                    wcsstr(GetCommandLineW(), L"--demo") != NULL);
     HANDLE mutex = NULL;
     if (!isTest) {
@@ -2844,9 +3711,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
     ZeroMemory(&si, sizeof(si));
     si.GdiplusVersion = 1;
     if (GdiplusStartup(&g_gdiToken, &si, NULL) != 0) {
+        /* GDI+ 起不来，所有依赖它的导出/编码路径都不该继续走 */
         MessageBoxW(NULL, L"GDI+ 初始化失败。", L"QuickShot", MB_ICONERROR | MB_OK);
         return 1;
     }
+    g_gdiplusOk = TRUE;
 
     g_fontLabel = CreateFontW(-15, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0,
                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -2911,6 +3780,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
             GdiplusShutdown(g_gdiToken);
             return r;
         }
+        if (wcsstr(cl, L"--stress-test")) {
+            int r = RunStabilityTest();
+            GdiplusShutdown(g_gdiToken);
+            return r;
+        }
         if (wcsstr(cl, L"--demo")) {
             int ac = 0, r = 1;
             LPWSTR *av = CommandLineToArgvW(cl, &ac);
@@ -2927,7 +3801,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
     if (!g_hMsgWnd) return 1;
 
     TrayAdd();
-    RegisterHotkeyNow();
+    HotkeyTryApply(g_mods, g_vk);
     QSLog("hotkey registered=%d mods=0x%X vk=0x%X", (int)g_hotkeyOk, g_mods, g_vk);
 
     if (!g_hotkeyOk) {
@@ -2953,12 +3827,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
         DispatchMessageW(&msg);
     }
 
-    if (g_hotkeyOk) UnregisterHotKey(g_hMsgWnd, HOTKEY_ID);
-    FreeCapture();
+    HotkeyUnregisterActive();
+    OverlayReleaseAll();
     if (g_fontLabel) DeleteObject(g_fontLabel);
     if (g_fontToast) DeleteObject(g_fontToast);
     if (g_fontText)  DeleteObject(g_fontText);
     if (g_fontIcon)  DeleteObject(g_fontIcon);
+    g_gdiplusOk = FALSE;
     GdiplusShutdown(g_gdiToken);
     if (mutex) CloseHandle(mutex);
     return 0;

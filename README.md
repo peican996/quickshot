@@ -78,13 +78,16 @@ gcc -O2 -s -Wall -mwindows shot.c app.res -o snapshot.exe ^
 
 ## 自检
 
-程序内置三个离屏自检，不需要真的截图就能验证渲染链路：
+程序内置四个离屏自检，不需要真的截图就能验证渲染链路：
 
 ```bat
 snapshot.exe --capture-test            :: 把 7 种标注烘焙成 selftest.png
 snapshot.exe --toolbar-test            :: 渲染工具条并校验按钮坐标与光标判定
 snapshot.exe --demo bg.png out.png     :: 用指定图片合成一张界面示意图
+snapshot.exe --stress-test             :: 稳定性自检（连续截图/文字编辑/马赛克/剪贴板/文件命名/热键冲突）
 ```
+
+`--stress-test` 会在结束时打印各阶段的 GDI 对象数量，全部通过时退出码为 0。
 
 ## 已知限制
 
