@@ -514,35 +514,61 @@ static void FreeCapture(void)
 
 /* ---------------------------------------------------------------- 读像素 / 输出 */
 
+/* 把 GDI 对象选进 DC 并记录原对象。
+ * 返回 FALSE 表示对象没建出来或选入失败——调用方必须放弃这次绘制，
+ * 绝不能继续用当前 DC 画（否则会画在错误的画笔/颜色上），
+ * 交给调用方负责删除刚创建的对象。 */
+static BOOL GdiSelect(HDC hdc, HGDIOBJ obj, HGDIOBJ *old)
+{
+    if (!hdc || !obj) return FALSE;
+    HGDIOBJ o = SelectObject(hdc, obj);
+    if (!o || o == (HGDIOBJ)HGDI_ERROR) return FALSE;
+    *old = o;
+    return TRUE;
+}
+
+/* 用完把原对象换回去；old 一定是我们自己选进去时拿到的有效句柄 */
+static void GdiRestore(HDC hdc, HGDIOBJ old)
+{
+    if (hdc && old && old != (HGDIOBJ)HGDI_ERROR) SelectObject(hdc, old);
+}
+
 static void DrawPenStroke(HDC hdc, const Annot *a)
 {
     if (a->npts < 2) return;
     HPEN pen = CreatePen(PS_SOLID, a->width, a->color);
-    HGDIOBJ old = SelectObject(hdc, pen);
+    HGDIOBJ old = NULL;
+    if (!GdiSelect(hdc, pen, &old)) { if (pen) DeleteObject(pen); return; }
     Polyline(hdc, a->pts, a->npts);
-    SelectObject(hdc, old);
+    GdiRestore(hdc, old);
     DeleteObject(pen);
 }
 
 static void DrawEllipseAnnot(HDC hdc, const Annot *a)
 {
     HPEN pen = CreatePen(PS_SOLID, a->width, a->color);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    HGDIOBJ oldBr  = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    Ellipse(hdc, a->rc.left, a->rc.top, a->rc.right, a->rc.bottom);
-    SelectObject(hdc, oldBr);
-    SelectObject(hdc, oldPen);
+    HGDIOBJ oldPen = NULL, oldBr = NULL;
+    if (!GdiSelect(hdc, pen, &oldPen)) { if (pen) DeleteObject(pen); return; }
+
+    if (GdiSelect(hdc, GetStockObject(NULL_BRUSH), &oldBr)) {
+        Ellipse(hdc, a->rc.left, a->rc.top, a->rc.right, a->rc.bottom);
+        GdiRestore(hdc, oldBr);
+    }
+    GdiRestore(hdc, oldPen);
     DeleteObject(pen);
 }
 
 static void DrawRectAnnot(HDC hdc, const Annot *a)
 {
     HPEN pen = CreatePen(PS_SOLID, a->width, a->color);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    HGDIOBJ oldBr  = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    Rectangle(hdc, a->rc.left, a->rc.top, a->rc.right, a->rc.bottom);
-    SelectObject(hdc, oldBr);
-    SelectObject(hdc, oldPen);
+    HGDIOBJ oldPen = NULL, oldBr = NULL;
+    if (!GdiSelect(hdc, pen, &oldPen)) { if (pen) DeleteObject(pen); return; }
+
+    if (GdiSelect(hdc, GetStockObject(NULL_BRUSH), &oldBr)) {
+        Rectangle(hdc, a->rc.left, a->rc.top, a->rc.right, a->rc.bottom);
+        GdiRestore(hdc, oldBr);
+    }
+    GdiRestore(hdc, oldPen);
     DeleteObject(pen);
 }
 
@@ -565,21 +591,25 @@ static void DrawArrowAnnot(HDC hdc, const Annot *a)
     head[2].y = y2 - (int)(hl * sin(ang + 0.42));
 
     HPEN pen = CreatePen(PS_SOLID, a->width, a->color);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    HGDIOBJ oldPen = NULL;
+    if (!GdiSelect(hdc, pen, &oldPen)) { if (pen) DeleteObject(pen); return; }
 
     /* 杆：缩短一点，别从箭头三角里穿出来 */
     MoveToEx(hdc, x1, y1, NULL);
     LineTo(hdc, (int)(x2 - hl * 0.55 * cos(ang)), (int)(y2 - hl * 0.55 * sin(ang)));
 
     HBRUSH br = CreateSolidBrush(a->color);
-    HGDIOBJ oldBr = SelectObject(hdc, br);
-    HGDIOBJ oldBk = SelectObject(hdc, GetStockObject(NULL_PEN));
-    Polygon(hdc, head, 3);
-    SelectObject(hdc, oldBk);
-    SelectObject(hdc, oldBr);
-    DeleteObject(br);
+    HGDIOBJ oldBr = NULL, oldNullPen = NULL;
+    if (GdiSelect(hdc, br, &oldBr)) {
+        if (GdiSelect(hdc, GetStockObject(NULL_PEN), &oldNullPen)) {
+            Polygon(hdc, head, 3);
+            GdiRestore(hdc, oldNullPen);
+        }
+        GdiRestore(hdc, oldBr);
+    }
+    if (br) DeleteObject(br);
 
-    SelectObject(hdc, oldPen);
+    GdiRestore(hdc, oldPen);
     DeleteObject(pen);
 }
 
@@ -766,22 +796,30 @@ static void DrawNumberAnnot(HDC hdc, const Annot *a)
     RECT r = { l, t, l + d, t + d };
 
     HBRUSH br = CreateSolidBrush(a->color);
-    HGDIOBJ oldBr = SelectObject(hdc, br);
-    HGDIOBJ oldPen = SelectObject(hdc, GetStockObject(NULL_PEN));
-    Ellipse(hdc, r.left, r.top, r.right, r.bottom);
-    SelectObject(hdc, oldPen);
-    SelectObject(hdc, oldBr);
-    DeleteObject(br);
+    HGDIOBJ oldBr = NULL, oldPen = NULL;
+    if (GdiSelect(hdc, br, &oldBr)) {
+        if (GdiSelect(hdc, GetStockObject(NULL_PEN), &oldPen)) {
+            Ellipse(hdc, r.left, r.top, r.right, r.bottom);
+            GdiRestore(hdc, oldPen);
+        }
+        GdiRestore(hdc, oldBr);
+    }
+    if (br) DeleteObject(br);
 
     HFONT f = CreateFontW(-(int)(d * 0.58), 0, 0, 0, FW_BOLD, 0, 0, 0,
                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                           CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
                           L"Microsoft YaHei UI");
-    HGDIOBJ oldF = SelectObject(hdc, f);
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, RGB(255, 255, 255));
-    DrawTextW(hdc, a->text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(hdc, oldF);
+    if (!f) return;                         /* 没字体就只保留圆底 */
+    HGDIOBJ oldF = NULL;
+    if (GdiSelect(hdc, f, &oldF)) {
+        int oldBk = SetBkMode(hdc, TRANSPARENT);
+        COLORREF oldTc = SetTextColor(hdc, RGB(255, 255, 255));
+        DrawTextW(hdc, a->text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SetTextColor(hdc, oldTc);
+        SetBkMode(hdc, oldBk);
+        GdiRestore(hdc, oldF);
+    }
     DeleteObject(f);
 }
 
@@ -792,12 +830,17 @@ static void DrawTextAnnot(HDC hdc, const Annot *a)
                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                           CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
                           L"Microsoft YaHei UI");
-    HGDIOBJ oldF = SelectObject(hdc, f);
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, a->color);
-    RECT r = { a->x, a->y, a->x + 4000, a->y + a->fontH * 3 };
-    DrawTextW(hdc, a->text, -1, &r, DT_LEFT | DT_TOP | DT_NOCLIP | DT_SINGLELINE);
-    SelectObject(hdc, oldF);
+    if (!f) return;
+    HGDIOBJ oldF = NULL;
+    if (GdiSelect(hdc, f, &oldF)) {
+        int oldBk = SetBkMode(hdc, TRANSPARENT);
+        COLORREF oldTc = SetTextColor(hdc, a->color);
+        RECT r = { a->x, a->y, a->x + 4000, a->y + a->fontH * 3 };
+        DrawTextW(hdc, a->text, -1, &r, DT_LEFT | DT_TOP | DT_NOCLIP | DT_SINGLELINE);
+        SetTextColor(hdc, oldTc);
+        SetBkMode(hdc, oldBk);
+        GdiRestore(hdc, oldF);
+    }
     DeleteObject(f);
 }
 
@@ -985,8 +1028,10 @@ static LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         RECT rc;
         GetClientRect(h, &rc);
         HBRUSH b = CreateSolidBrush(RGB(28, 28, 28));
-        FillRect(dc, &rc, b);
-        DeleteObject(b);
+        if (b) {
+            FillRect(dc, &rc, b);
+            DeleteObject(b);
+        }
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(238, 238, 238));
         HGDIOBJ oldF = SelectObject(dc, g_fontToast);
@@ -1513,8 +1558,10 @@ static void DrawPalette(HDC hdc)
         RECT r = SwatchRect(i);
 
         HBRUSH b = CreateSolidBrush(g_palette[i]);
-        FillRect(hdc, &r, b);
-        DeleteObject(b);
+        if (b) {
+            FillRect(hdc, &r, b);
+            DeleteObject(b);
+        }
 
         BOOL sel = (g_annColor == g_palette[i]);
         BOOL hot = (g_ov.hotSwatch == i);
@@ -1523,12 +1570,14 @@ static void DrawPalette(HDC hdc)
                     : hot ? RGB(70, 70, 70)
                           : RGB(145, 145, 145);
         HBRUSH edge = CreateSolidBrush(ec);
-        FrameRect(hdc, &r, edge);
-        if (sel) {
-            RECT o = { r.left - 1, r.top - 1, r.right + 1, r.bottom + 1 };
-            FrameRect(hdc, &o, edge);
+        if (edge) {
+            FrameRect(hdc, &r, edge);
+            if (sel) {
+                RECT o = { r.left - 1, r.top - 1, r.right + 1, r.bottom + 1 };
+                FrameRect(hdc, &o, edge);
+            }
+            DeleteObject(edge);
         }
-        DeleteObject(edge);
     }
 }
 
@@ -1543,8 +1592,10 @@ static void DrawSizeRowBg(HDC hdc)
         FillRect(hdc, &r, sel ? g_brTbActive : (hot ? g_brTbHover : g_brTbBg));
 
         HBRUSH edge = CreateSolidBrush(sel ? RGB(60, 130, 200) : RGB(178, 178, 178));
-        FrameRect(hdc, &r, edge);
-        DeleteObject(edge);
+        if (edge) {
+            FrameRect(hdc, &r, edge);
+            DeleteObject(edge);
+        }
     }
 }
 
@@ -1569,8 +1620,10 @@ static void DrawPinBg(HDC hdc)
     FillRect(hdc, &r, hot ? g_brTbHover : g_brTbBg);
 
     HBRUSH edge = CreateSolidBrush(hot ? RGB(70, 70, 70) : RGB(178, 178, 178));
-    FrameRect(hdc, &r, edge);
-    DeleteObject(edge);
+    if (edge) {
+        FrameRect(hdc, &r, edge);
+        DeleteObject(edge);
+    }
 }
 
 static void DrawPinIcon(GpGraphics *g)
@@ -1610,26 +1663,28 @@ static void DrawToolbar(HDC hdc)
 
     FrameRect(hdc, &t, g_brTbBorder);
 
-    /* 行分隔 + 分组竖线 */
-    HGDIOBJ oldPen = SelectObject(hdc, g_penSep);
-    int ry = ROW2_Y(t);
-    MoveToEx(hdc, t.left + 4, ry, NULL);
-    LineTo(hdc, t.right - 4, ry);
+    /* 行分隔 + 分组竖线；画笔没建出来（极端情况下）就跳过这几条线 */
+    HGDIOBJ oldPen = NULL;
+    if (GdiSelect(hdc, g_penSep, &oldPen)) {
+        int ry = ROW2_Y(t);
+        MoveToEx(hdc, t.left + 4, ry, NULL);
+        LineTo(hdc, t.right - 4, ry);
 
-    int v1 = t.left + BtnX(BTN_UNDO) - 4;
-    int v2 = t.left + min(BtnX(BTN_OK), BtnX(BTN_NO)) - 4;   /* 分组线始终在 ✗✓ 左侧 */
-    MoveToEx(hdc, v1, t.top + 8, NULL);
-    LineTo(hdc, v1, ry - 6);
-    MoveToEx(hdc, v2, t.top + 8, NULL);
-    LineTo(hdc, v2, ry - 6);
+        int v1 = t.left + BtnX(BTN_UNDO) - 4;
+        int v2 = t.left + min(BtnX(BTN_OK), BtnX(BTN_NO)) - 4;   /* 分组线始终在 ✗✓ 左侧 */
+        MoveToEx(hdc, v1, t.top + 8, NULL);
+        LineTo(hdc, v1, ry - 6);
+        MoveToEx(hdc, v2, t.top + 8, NULL);
+        LineTo(hdc, v2, ry - 6);
 
-    int s1 = t.left + SIZE_X - 8;
-    int s2 = t.left + PIN_X - 8;
-    MoveToEx(hdc, s1, ry + 5, NULL);
-    LineTo(hdc, s1, t.bottom - 5);
-    MoveToEx(hdc, s2, ry + 5, NULL);
-    LineTo(hdc, s2, t.bottom - 5);
-    SelectObject(hdc, oldPen);
+        int s1 = t.left + SIZE_X - 8;
+        int s2 = t.left + PIN_X - 8;
+        MoveToEx(hdc, s1, ry + 5, NULL);
+        LineTo(hdc, s1, t.bottom - 5);
+        MoveToEx(hdc, s2, ry + 5, NULL);
+        LineTo(hdc, s2, t.bottom - 5);
+        GdiRestore(hdc, oldPen);
+    }
 
     /* 底色元素先画完，再统一上矢量图标，避免 GDI / GDI+ 混用 */
     DrawPalette(hdc);
@@ -1672,24 +1727,25 @@ static void OverlayDraw(HDC hdcTarget)
             RestoreDC(g_ov.hdcBack, saved);
         }
 
-        /* 选中框：外白内蓝 */
-        HGDIOBJ oldBr = SelectObject(g_ov.hdcBack, GetStockObject(NULL_BRUSH));
-
-        HGDIOBJ oldPen = SelectObject(g_ov.hdcBack, g_penOuter);
-        Rectangle(g_ov.hdcBack, s.left - 1, s.top - 1, s.right + 1, s.bottom + 1);
-        SelectObject(g_ov.hdcBack, oldPen);
-
-        oldPen = SelectObject(g_ov.hdcBack, g_penSel);
-        Rectangle(g_ov.hdcBack, s.left, s.top, s.right, s.bottom);
-        SelectObject(g_ov.hdcBack, oldPen);
-
-        SelectObject(g_ov.hdcBack, oldBr);
+        /* 选中框：外白内蓝（画笔没建出来就跳过边框，不影响内容） */
+        HGDIOBJ oldBr = NULL, oldPen = NULL;
+        BOOL haveBr = GdiSelect(g_ov.hdcBack, GetStockObject(NULL_BRUSH), &oldBr);
+        if (haveBr && GdiSelect(g_ov.hdcBack, g_penOuter, &oldPen)) {
+            Rectangle(g_ov.hdcBack, s.left - 1, s.top - 1, s.right + 1, s.bottom + 1);
+            GdiRestore(g_ov.hdcBack, oldPen);
+        }
+        if (haveBr && GdiSelect(g_ov.hdcBack, g_penSel, &oldPen)) {
+            Rectangle(g_ov.hdcBack, s.left, s.top, s.right, s.bottom);
+            GdiRestore(g_ov.hdcBack, oldPen);
+        }
+        GdiRestore(g_ov.hdcBack, oldBr);
 
         /* 尺寸标签：贴选区左上角外侧，放不下就挪进去 */
         WCHAR label[64];
         wsprintfW(label, L"%d × %d", SelW(), SelH());
 
-        SelectObject(g_ov.hdcBack, g_fontLabel);
+        HGDIOBJ oldFont = NULL;
+        GdiSelect(g_ov.hdcBack, g_fontLabel, &oldFont);   /* 字体没建出来就用默认字体量 */
         SIZE ts = {0, 0};
         GetTextExtentPoint32W(g_ov.hdcBack, label, lstrlenW(label), &ts);
 
@@ -1702,10 +1758,13 @@ static void OverlayDraw(HDC hdcTarget)
 
         RECT tr = { lx, ly, lx + tw, ly + th };
         FillRect(g_ov.hdcBack, &tr, g_brLabelBg);
-        SetBkMode(g_ov.hdcBack, TRANSPARENT);
-        SetTextColor(g_ov.hdcBack, RGB(255, 255, 255));
+        int oldBk = SetBkMode(g_ov.hdcBack, TRANSPARENT);
+        COLORREF oldTc = SetTextColor(g_ov.hdcBack, RGB(255, 255, 255));
         DrawTextW(g_ov.hdcBack, label, -1, &tr,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SetTextColor(g_ov.hdcBack, oldTc);
+        SetBkMode(g_ov.hdcBack, oldBk);
+        GdiRestore(g_ov.hdcBack, oldFont);
 
         /* 松手之后才显示手柄和工具条 */
         if (g_ov.state != ST_NEW) {
@@ -1996,8 +2055,10 @@ static LRESULT CALLBACK PinProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             /* 描一圈细边，和白底页面区分开 */
             HBRUSH b = CreateSolidBrush(RGB(120, 120, 120));
             RECT r = { 0, 0, pd->w, pd->h };
-            FrameRect(dc, &r, b);
-            DeleteObject(b);
+            if (b) {
+                FrameRect(dc, &r, b);
+                DeleteObject(b);
+            }
         }
         EndPaint(h, &ps);
         return 0;
@@ -2684,11 +2745,38 @@ static BOOL HotkeyTryApply(UINT mods, UINT vk)
     return TRUE;
 }
 
+/* 启动时注册热键：优先用上次保存的组合；被占用就依次尝试其它预设。
+ * 回退只影响本次运行，不写注册表——下次启动仍优先尝试用户原来选的那个，
+ * 避免把一次临时的占用变成永久的配置变更。 */
+enum { HK_START_NONE = 0, HK_START_SAVED, HK_START_FALLBACK };
+
+static int HotkeyRegisterOnStartup(void)
+{
+    UINT savedMods = g_mods, savedVk = g_vk;
+
+    if (HotkeyTryApply(savedMods, savedVk)) return HK_START_SAVED;
+
+    QSLog("hotkey: saved 0x%X/0x%X occupied, trying fallbacks", savedMods, savedVk);
+    for (int i = 0; i < PRESET_COUNT; i++) {
+        if (g_presets[i].mods == savedMods && g_presets[i].vk == savedVk) continue;
+        if (HotkeyTryApply(g_presets[i].mods, g_presets[i].vk)) {
+            QSLog("hotkey: fallback -> 0x%X/0x%X (not persisted)", g_mods, g_vk);
+            return HK_START_FALLBACK;
+        }
+    }
+    QSLog("hotkey: all presets occupied");
+    return HK_START_NONE;
+}
+
 static void ShowTrayMenu(void)
 {
     HMENU m = CreatePopupMenu();
     HMENU hk = CreatePopupMenu();
-
+    if (!m || !hk) {
+        if (m) DestroyMenu(m);
+        if (hk) DestroyMenu(hk);
+        return;
+    }
     for (int i = 0; i < PRESET_COUNT; i++) {
         BOOL active = (g_presets[i].mods == g_mods && g_presets[i].vk == g_vk);
         AppendMenuW(hk, MF_STRING | (active ? MF_CHECKED : 0),
@@ -2715,6 +2803,15 @@ static void ShowTrayMenu(void)
     DestroyMenu(m);
 }
 
+/* 当前生效组合对应的菜单文案；不在预设里就返回通用文案 */
+static const WCHAR *HotkeyLabel(void)
+{
+    for (int i = 0; i < PRESET_COUNT; i++) {
+        if (g_presets[i].mods == g_mods && g_presets[i].vk == g_vk) return g_presets[i].label;
+    }
+    return L"当前快捷键";
+}
+
 static void TrayAdd(void)
 {
     ZeroMemory(&g_nid, sizeof(g_nid));
@@ -2726,8 +2823,21 @@ static void TrayAdd(void)
     g_nid.hIcon = (HICON)LoadImageW(g_hInst, MAKEINTRESOURCEW(1), IMAGE_ICON,
                                     0, 0, LR_DEFAULTSIZE);
     if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
-    lstrcpynW(g_nid.szTip, L"QuickShot 截图  (Ctrl+Alt+A)", 128);
+    lstrcpynW(g_nid.szTip, L"QuickShot 截图", 128);
     Shell_NotifyIconW(NIM_ADD, &g_nid);
+}
+
+/* 托盘提示跟着实际生效的热键走（启动回退或手动切换后都要刷新） */
+static void TrayUpdateTip(void)
+{
+    if (!g_nid.hWnd) return;
+
+    WCHAR tip[128];
+    if (g_hotkeyOk) wsprintfW(tip, L"QuickShot 截图  (%s)", HotkeyLabel());
+    else            lstrcpynW(tip, L"QuickShot 截图  (快捷键未生效)", 128);
+
+    lstrcpynW(g_nid.szTip, tip, 128);
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
 static void TrayRemove(void)
@@ -2773,6 +2883,7 @@ static LRESULT CALLBACK MsgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             if (HotkeyTryApply(g_presets[idx].mods, g_presets[idx].vk)) {
                 SaveSettingDword(L"HotMods", g_mods);
                 SaveSettingDword(L"HotVk", g_vk);
+                TrayUpdateTip();           /* 提示文字跟着实际生效的组合走 */
             } else {
                 MessageBoxW(NULL,
                             L"该快捷键已被其他程序占用，请换一个。\n\n原快捷键保持不变。",
@@ -3775,16 +3886,17 @@ static void TestFileNames(void)
     RemoveDirectoryW(dir);
 }
 
-/* 用另一个线程占住 Ctrl+Alt+S，模拟"被其他程序占用" */
+/* 用另一个线程占住指定组合，模拟"被其他程序占用" */
 static HANDLE g_hkReady, g_hkRelease, g_hkThread;
 static volatile LONG g_hkBlocked = 0;
+static UINT g_hkBlockMods, g_hkBlockVk;
 
 static DWORD WINAPI HotkeyBlockerThread(LPVOID unused)
 {
     (void)unused;
     HWND w = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 0, 0,
                              HWND_MESSAGE, NULL, NULL, NULL);
-    if (w && RegisterHotKey(w, 0xBEEF, MOD_CONTROL | MOD_ALT, VK_F11)) {
+    if (w && RegisterHotKey(w, 0xBEEF, g_hkBlockMods, g_hkBlockVk)) {
         InterlockedExchange(&g_hkBlocked, 1);
         SetEvent(g_hkReady);
         WaitForSingleObject(g_hkRelease, INFINITE);
@@ -3794,6 +3906,33 @@ static DWORD WINAPI HotkeyBlockerThread(LPVOID unused)
     }
     if (w) DestroyWindow(w);
     return 0;
+}
+
+/* 起一个占位线程；失败返回 NULL（调用方按 SKIP 处理） */
+static BOOL StartHotkeyBlocker(UINT mods, UINT vk)
+{
+    g_hkBlockMods = mods;
+    g_hkBlockVk   = vk;
+    g_hkReady     = CreateEventW(NULL, TRUE, FALSE, NULL);
+    g_hkRelease   = CreateEventW(NULL, TRUE, FALSE, NULL);
+    InterlockedExchange(&g_hkBlocked, 0);
+    if (!g_hkReady || !g_hkRelease) return FALSE;
+    g_hkThread = CreateThread(NULL, 0, HotkeyBlockerThread, NULL, 0, NULL);
+    if (!g_hkThread) return FALSE;
+    WaitForSingleObject(g_hkReady, 3000);
+    return (InterlockedCompareExchange(&g_hkBlocked, 1, 1) == 1);
+}
+
+static void StopHotkeyBlocker(void)
+{
+    if (g_hkRelease) SetEvent(g_hkRelease);
+    if (g_hkThread) {
+        WaitForSingleObject(g_hkThread, 3000);
+        CloseHandle(g_hkThread);
+        g_hkThread = NULL;
+    }
+    if (g_hkReady)   { CloseHandle(g_hkReady);   g_hkReady = NULL; }
+    if (g_hkRelease) { CloseHandle(g_hkRelease); g_hkRelease = NULL; }
 }
 
 static void TestHotkey(void)
@@ -3815,46 +3954,86 @@ static void TestHotkey(void)
     UINT idBefore = g_hotkeyId;
     UINT aM = g_mods, aV = g_vk;
 
-    g_hkReady   = CreateEventW(NULL, TRUE, FALSE, NULL);
-    g_hkRelease = CreateEventW(NULL, TRUE, FALSE, NULL);
-    InterlockedExchange(&g_hkBlocked, 0);
-    g_hkThread  = CreateThread(NULL, 0, HotkeyBlockerThread, NULL, 0, NULL);
-    if (!g_hkReady || !g_hkRelease || !g_hkThread) {
-        TestCheck(FALSE, "hotkey: blocker thread");
+    if (!StartHotkeyBlocker(MOD_CONTROL | MOD_ALT, VK_F11)) {
+        StopHotkeyBlocker();
         HotkeyUnregisterActive();
+        TestCheck(!g_hotkeyOk && g_hotkeyId == 0, "hotkey unregistered");
         return;
     }
-    WaitForSingleObject(g_hkReady, 3000);
 
-    if (InterlockedCompareExchange(&g_hkBlocked, 1, 1) == 1) {
-        /* 新组合被占用：必须失败，且旧热键、旧配置都不能动 */
-        BOOL switched = HotkeyTryApply(MOD_CONTROL | MOD_ALT, VK_F11);
-        TestCheck(!switched, "occupied hotkey rejected");
-        TestCheck(g_mods == aM && g_vk == aV && g_hotkeyId == idBefore,
-                  "old hotkey kept after failed switch");
+    /* 新组合被占用：必须失败，且旧热键、旧配置都不能动 */
+    BOOL switched = HotkeyTryApply(MOD_CONTROL | MOD_ALT, VK_F11);
+    TestCheck(!switched, "occupied hotkey rejected");
+    TestCheck(g_mods == aM && g_vk == aV && g_hotkeyId == idBefore,
+              "old hotkey kept after failed switch");
 
-        TestCheck(HotkeyTryApply(MOD_CONTROL | MOD_SHIFT, VK_F12), "switch to free hotkey works");
+    TestCheck(HotkeyTryApply(MOD_CONTROL | MOD_SHIFT, VK_F12), "switch to free hotkey works");
 
-        SetEvent(g_hkRelease);
-        WaitForSingleObject(g_hkThread, 3000);
-        CloseHandle(g_hkThread);
-        CloseHandle(g_hkReady);
-        CloseHandle(g_hkRelease);
-        g_hkThread = NULL; g_hkReady = g_hkRelease = NULL;
-
-        TestCheck(HotkeyTryApply(MOD_CONTROL | MOD_ALT, VK_F11), "released combo can be applied");
-    } else {
-        printf("[SKIP] hotkey conflict: Ctrl+Alt+F11 already taken by another app\n");
-        SetEvent(g_hkRelease);
-        WaitForSingleObject(g_hkThread, 3000);
-        CloseHandle(g_hkThread);
-        CloseHandle(g_hkReady);
-        CloseHandle(g_hkRelease);
-        g_hkThread = NULL; g_hkReady = g_hkRelease = NULL;
-    }
+    StopHotkeyBlocker();
+    TestCheck(HotkeyTryApply(MOD_CONTROL | MOD_ALT, VK_F11), "released combo can be applied");
 
     HotkeyUnregisterActive();
     TestCheck(!g_hotkeyOk && g_hotkeyId == 0, "hotkey unregistered");
+}
+
+/* 启动恢复：保存的组合被占用时自动回退到其它预设，且不写注册表 */
+static void TestHotkeyStartupFallback(void)
+{
+    const UINT savedM = MOD_CONTROL | MOD_SHIFT;
+    const UINT savedV = 'A';               /* 预设 3，故意占住它 */
+
+    g_hotkeyId = 0;
+    g_hotkeyOk = FALSE;
+    g_mods = savedM;
+    g_vk   = savedV;
+
+    BOOL blocked = StartHotkeyBlocker(savedM, savedV);
+    int r = HotkeyRegisterOnStartup();
+    printf("startup hotkey: blocked=%d result=%d mods=0x%X vk=0x%X\n",
+           blocked, r, g_mods, g_vk);
+
+    if (blocked) {
+        TestCheck(r == HK_START_FALLBACK, "startup falls back when saved hotkey is occupied");
+        TestCheck(g_hotkeyOk && !(g_mods == savedM && g_vk == savedV),
+                  "fallback differs from saved combo");
+        TestCheck(g_mods == (UINT)(MOD_CONTROL | MOD_ALT) ||
+                  g_mods == (UINT)(MOD_ALT | MOD_SHIFT),
+                  "fallback comes from preset list");
+    } else {
+        printf("[SKIP] startup fallback: Ctrl+Shift+A already taken by another app\n");
+    }
+    StopHotkeyBlocker();
+    HotkeyUnregisterActive();
+    TestCheck(!g_hotkeyOk && g_hotkeyId == 0, "startup hotkey released");
+
+    /* 保存的组合空闲时，启动应直接用它，不做无谓回退 */
+    g_hotkeyId = 0;
+    g_hotkeyOk = FALSE;
+    g_mods = MOD_CONTROL | MOD_ALT;
+    g_vk   = VK_F9;
+    int r2 = HotkeyRegisterOnStartup();
+    TestCheck(r2 == HK_START_SAVED && g_hotkeyOk, "startup uses saved hotkey when free");
+    HotkeyUnregisterActive();
+}
+
+/* GDI 句柄选入/恢复的防御逻辑（无法真的把 GDI 用尽，只验证非法入参被拒） */
+static void TestGdiGuards(void)
+{
+    TestSurface s;
+    if (!TestSurfaceCreate(&s, 8, 8)) { TestCheck(FALSE, "gdi guards: surface"); return; }
+
+    HGDIOBJ old = NULL;
+    TestCheck(!GdiSelect(NULL, GetStockObject(BLACK_PEN), &old), "gdi guards: NULL dc rejected");
+    TestCheck(!GdiSelect(s.dc, NULL, &old), "gdi guards: NULL object rejected");
+    GdiRestore(NULL, NULL);                     /* 空入参不应影响任何 DC 状态 */
+
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+    if (pen) {
+        TestCheck(GdiSelect(s.dc, pen, &old), "gdi guards: valid object selected");
+        GdiRestore(s.dc, old);
+        DeleteObject(pen);
+    }
+    TestSurfaceDestroy(&s);
 }
 
 /* 预热：先把各子系统的一次性系统缓存（EDIT 控件内部对象、GDI+ 全局对象等）
@@ -3928,6 +4107,8 @@ static int RunStabilityTest(void)
     TestClipboardBusy();
     TestFileNames();
     TestHotkey();
+    TestHotkeyStartupFallback();
+    TestGdiGuards();
 
     /* 模拟一次正常退出：窗口销毁 + 资源统一释放 */
     if (g_ov.hwnd == overlay) g_ov.hwnd = NULL;
@@ -4078,21 +4259,30 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
     if (!g_hMsgWnd) return 1;
 
     TrayAdd();
-    HotkeyTryApply(g_mods, g_vk);
-    QSLog("hotkey registered=%d mods=0x%X vk=0x%X", (int)g_hotkeyOk, g_mods, g_vk);
+    int hkStart = HotkeyRegisterOnStartup();
+    TrayUpdateTip();
+    QSLog("hotkey start=%d registered=%d mods=0x%X vk=0x%X",
+          hkStart, (int)g_hotkeyOk, g_mods, g_vk);
 
-    if (!g_hotkeyOk) {
+    if (hkStart == HK_START_NONE) {
         MessageBoxW(NULL,
-                    L"快捷键 Ctrl+Alt+A 注册失败，可能被 QQ 等程序占用了。\n\n"
+                    L"当前保存的快捷键和其它预设都被占用了。\n\n"
                     L"请右键托盘图标，在「快捷键」里换一个组合。",
                     L"QuickShot", MB_ICONWARNING | MB_OK);
     }
 
     {
+        /* 提示里显示实际生效的组合；回退时说明原因，避免"配置和实际不一样"的困惑 */
+        const WCHAR *hkLabel = HotkeyLabel();
+
         WCHAR tip[160];
-        wsprintfW(tip, L"已启动  ·  按 %s 截图",
-                  (g_hotkeyOk && g_mods == (MOD_CONTROL | MOD_ALT) && g_vk == 'A')
-                      ? L"Ctrl+Alt+A" : L"已设置的快捷键");
+        if (hkStart == HK_START_FALLBACK)
+            wsprintfW(tip, L"原快捷键被占用，已临时改用 %s", hkLabel);
+        else if (g_hotkeyOk)
+            wsprintfW(tip, L"已启动  ·  按 %s 截图", hkLabel);
+        else
+            lstrcpynW(tip, L"已启动  ·  请右键托盘图标设置快捷键", 160);
+
         ToastShowAt(tip,
                     GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) / 2,
                     GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN) - 90);
