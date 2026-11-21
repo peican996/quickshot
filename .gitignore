@@ -1,0 +1,14 @@
+# 编译产物
+*.exe
+*.o
+*.obj
+app.res
+
+# 自检 / 调试输出
+*.log
+selftest.png
+toolbar.png
+
+# 编辑器
+.vscode/
+*.swp
