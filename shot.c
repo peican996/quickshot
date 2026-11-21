@@ -102,7 +102,7 @@ enum {
 enum { H_TL = 0, H_T, H_TR, H_R, H_BR, H_B, H_BL, H_L, H_COUNT };
 #define HANDLE_HIT 8       /* 手柄命中半径（像素） */
 #define TB_BTN     30      /* 第一行按钮宽 */
-#define TB_NBTN    11      /* 选择 画笔 矩形 椭圆 箭头 马赛克 文字 序号 撤销 ✓ ✗ */
+#define TB_NBTN    11      /* 选择 画笔 矩形 椭圆 箭头 马赛克 文字 序号 撤销 ✗ ✓ */
 #define TB_ROW1    34      /* 第一行高（工具按钮） */
 #define TB_ROW2    26      /* 第二行高（颜色 / 粗细 / 钉图） */
 #define TB_H       (TB_ROW1 + TB_ROW2)
@@ -401,33 +401,56 @@ done:
 }
 
 /* 由 hdcCap 生成变暗底图（约 45% 亮度），并把原图 alpha 归位。
- * BitBlt 失败时底图内容不可信，返回 FALSE 让上层放弃这次截图。 */
+ * BitBlt 失败时底图内容不可信，返回 FALSE 让上层放弃这次截图。
+ * 只有确认拿到合法的 DIB 像素并完整做完变暗，才返回 TRUE。 */
 static BOOL OvDimBuffers(void)
 {
-    if (!g_ov.hdcDim || !g_ov.hdcCap) return FALSE;
+    if (!g_ov.hdcDim || !g_ov.hdcCap || !g_ov.pixCap) return FALSE;
+    if (g_ov.vw <= 0 || g_ov.vh <= 0) return FALSE;
+    /* vw * vh * 4 不能溢出（size_t 下也做一次上限保护） */
+    if ((size_t)g_ov.vw > (((size_t)-1) / 4u) / (size_t)g_ov.vh) return FALSE;
+
     if (!BitBlt(g_ov.hdcDim, 0, 0, g_ov.vw, g_ov.vh, g_ov.hdcCap, 0, 0, SRCCOPY))
         return FALSE;
 
+    /* 取 DIB 像素指针：拿不到或尺寸对不上就说明底图不是我们建的那块，直接失败 */
     BITMAP bm;
-    if (GetObjectW(g_ov.hbmDim, sizeof(bm), &bm)) {
-        BYTE *dst = (BYTE *)bm.bmBits;
-        if (dst) {
-            size_t n = (size_t)g_ov.vw * g_ov.vh;
-            for (size_t i = 0; i < n; i++) {
-                BYTE *p = dst + i * 4;
-                p[0] = (BYTE)(p[0] * 45 / 100);
-                p[1] = (BYTE)(p[1] * 45 / 100);
-                p[2] = (BYTE)(p[2] * 45 / 100);
-                p[3] = 255;
-            }
+    ZeroMemory(&bm, sizeof(bm));
+    if (!GetObjectW(g_ov.hbmDim, sizeof(bm), &bm)) {
+        QSLog("OvDimBuffers: GetObject FAIL err=%lu", GetLastError());
+        return FALSE;
+    }
+    if (!bm.bmBits || bm.bmBitsPixel != 32) {
+        QSLog("OvDimBuffers: bad DIB (bits=%p bpp=%u)", bm.bmBits, bm.bmBitsPixel);
+        return FALSE;
+    }
+    if (bm.bmWidth != g_ov.vw || bm.bmHeight != g_ov.vh) {
+        QSLog("OvDimBuffers: size mismatch %ldx%ld vs %dx%d",
+              bm.bmWidth, bm.bmHeight, g_ov.vw, g_ov.vh);
+        return FALSE;
+    }
+    if (bm.bmWidthBytes < (LONG)((size_t)g_ov.vw * 4u)) {
+        QSLog("OvDimBuffers: stride too small %ld", bm.bmWidthBytes);
+        return FALSE;
+    }
+
+    /* 按 DIB 实际行字节数遍历，不假设行宽恰好等于 vw*4 */
+    BYTE *dst = (BYTE *)bm.bmBits;
+    size_t stride = (size_t)bm.bmWidthBytes;
+    for (int y = 0; y < g_ov.vh; y++) {
+        BYTE *row = dst + (size_t)y * stride;
+        for (int x = 0; x < g_ov.vw; x++) {
+            BYTE *p = row + (size_t)x * 4;
+            p[0] = (BYTE)(p[0] * 45 / 100);
+            p[1] = (BYTE)(p[1] * 45 / 100);
+            p[2] = (BYTE)(p[2] * 45 / 100);
+            p[3] = 255;
         }
     }
 
     BYTE *cap = (BYTE *)g_ov.pixCap;
-    if (cap) {
-        size_t n = (size_t)g_ov.vw * g_ov.vh;
-        for (size_t i = 0; i < n; i++) cap[i * 4 + 3] = 255;
-    }
+    size_t n = (size_t)g_ov.vw * g_ov.vh;
+    for (size_t i = 0; i < n; i++) cap[i * 4 + 3] = 255;
     return TRUE;
 }
 
@@ -586,15 +609,21 @@ typedef struct {
 } MosaicCache;
 
 static MosaicCache g_mosaicCache[MAX_ANNOT];
-static MosaicCache g_mosaicScratch;      /* 超大区域走的临时缓冲，不参与缓存 */
+static MosaicCache g_mosaicScratch;      /* 超大区域走的临时缓冲，不占正式缓存预算 */
 static unsigned     g_mosaicEpoch = 1;
-static size_t       g_mosaicCachedPixels;  /* 当前缓存占用的像素总数，用于总预算 */
+static size_t       g_mosaicCachedPixels;  /* 只统计 g_mosaicCache 里的正式缓存，不含量 scratch */
 
 static BOOL RectEq(RECT a, RECT b);
 
+/* scratch 是单块临时缓冲，用完即弃，不参与正式缓存的预算统计 */
+static BOOL MosaicBudgeted(const MosaicCache *c)
+{
+    return c != &g_mosaicScratch;
+}
+
 static void MosaicCacheFree(MosaicCache *c)
 {
-    if (c->capW > 0 && c->capH > 0) {     /* 归还预算 */
+    if (MosaicBudgeted(c) && c->capW > 0 && c->capH > 0) {   /* 归还正式缓存预算 */
         size_t px = (size_t)c->capW * (size_t)c->capH;
         g_mosaicCachedPixels = (g_mosaicCachedPixels >= px) ? g_mosaicCachedPixels - px : 0;
     }
@@ -653,7 +682,7 @@ static BOOL MosaicEnsure(MosaicCache *c, int w, int h)
 
     c->capW = w;
     c->capH = h;
-    g_mosaicCachedPixels += (size_t)w * (size_t)h;
+    if (MosaicBudgeted(c)) g_mosaicCachedPixels += (size_t)w * (size_t)h;
     return TRUE;
 }
 
@@ -700,7 +729,8 @@ static void DrawMosaicAnnot(HDC hdc, const Annot *a, int idx)
     size_t pixels = (size_t)w * (size_t)h;
     MosaicCache *slot = (idx >= 0 && idx < MAX_ANNOT) ? &g_mosaicCache[idx] : NULL;
     size_t slotPixels = slot ? (size_t)slot->capW * (size_t)slot->capH : 0;
-    /* 单条超限、或者加上它要突破总预算时，就退回不缓存的临时缓冲 */
+    /* 单条超限、或者加上它要突破总预算时，就退回不缓存的临时缓冲。
+     * 预算只统计正式缓存槽位；scratch 只是单块临时画布，不计入。 */
     BOOL cacheable = slot && pixels <= (size_t)MOSAIC_CACHE_MAX_PIXELS &&
                      g_mosaicCachedPixels - slotPixels + pixels <= (size_t)MOSAIC_CACHE_BUDGET;
     MosaicCache *c = cacheable ? slot : &g_mosaicScratch;
@@ -1107,13 +1137,15 @@ enum { BTN_MOVE = 0, BTN_PEN, BTN_RECT, BTN_ELLIPSE, BTN_ARROW, BTN_MOSAIC, BTN_
        BTN_NUMBER, BTN_UNDO, BTN_OK, BTN_NO };
 
 /* 第 i 个按钮相对工具条左边的偏移。两行布局：
- *   第一行：工具组(0..7) | 撤销(8) | ✓(9) ✗(10)
+ *   第一行：工具组(0..7) | 撤销(8) | ✗(10) ✓(9)
  *   第二行：颜色 | 粗细 | 钉住 */
 static int BtnX(int i)
 {
     if (i <= 7) return 6 + i * TB_BTN;       /* 工具组 6..246 */
     if (i == 8) return 254;                  /* 撤销   254..284 */
-    return 292 + (i - 9) * TB_BTN;           /* ✓292 ✗322 */
+    /* 末尾两个按钮：取消在左、确认在右（确认放在最外侧） */
+    if (i == BTN_OK) return 292 + TB_BTN;    /* ✓ 322..352 */
+    return 292;                              /* ✗ 292..322 */
 }
 
 /* 工具条贴着选区右下角；下方放不下就放上方 */
@@ -1585,7 +1617,7 @@ static void DrawToolbar(HDC hdc)
     LineTo(hdc, t.right - 4, ry);
 
     int v1 = t.left + BtnX(BTN_UNDO) - 4;
-    int v2 = t.left + BtnX(BTN_OK) - 4;
+    int v2 = t.left + min(BtnX(BTN_OK), BtnX(BTN_NO)) - 4;   /* 分组线始终在 ✗✓ 左侧 */
     MoveToEx(hdc, v1, t.top + 8, NULL);
     LineTo(hdc, v1, ry - 6);
     MoveToEx(hdc, v2, t.top + 8, NULL);
@@ -2448,7 +2480,14 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
                     if ((a->rc.right - a->rc.left) < 3 ||
                         (a->rc.bottom - a->rc.top) < 3) keep = FALSE;
                 }
-                if (!keep) g_annCount--;
+                if (!keep) {
+                    g_annCount--;
+                    /* 这条标注在拖动过程中可能已经生成过马赛克缓存，
+                     * 丢弃后必须让它失效：否则同一下标复用时可能命中旧图。
+                     * 其它删除路径（撤销、文字清空、重新选区）也都会 bump。 */
+                    MosaicEpochBump();
+                    QSLog("overlay: annot discarded (too small), epoch=%u", g_mosaicEpoch);
+                }
             }
             g_ov.state = ST_SELECTED;
             OverlayRedraw();
@@ -2794,9 +2833,11 @@ static int RunDemoShot(const WCHAR *bgPath, const WCHAR *outPath, BOOL showAll)
     GdipDeleteGraphics(gp);
     GdipDisposeImage((GpImage *)bmp);
 
-    OvDimBuffers();
-
-    /* 界面状态：选中一块区域，工具停在椭圆 */
+    if (!OvDimBuffers()) {
+        FreeCapture();
+        OverlayGdiFree();
+        return 1;
+    }
     g_ov.hasSel = TRUE;
     g_ov.state  = ST_SELECTED;
     g_ov.sel.left  = 430;  g_ov.sel.top    = 196;
@@ -3274,6 +3315,31 @@ static void FillTestPattern(void)
     }
 }
 
+/* 逐像素比较预览图与导出图的重合区域。
+ * preview 是遮罩客户区大小的 top-down DIB，export 是选区的 bottom-up DIB。
+ * 传入的 area 已避开选框边框/手柄/尺寸标签那几像素（它们是界面装饰，
+ * 本来就不属于导出内容），区域内所有像素必须完全一致。 */
+static void ComparePreviewVsExport(const void *pbits, const void *ebits,
+                                   int ew, int eh, RECT area,
+                                   int offX, int offY, const char *what)
+{
+    size_t total = 0, diff = 0;
+    if (pbits && ebits) {
+        for (int y = area.top; y < area.bottom; y++) {
+            for (int x = area.left; x < area.right; x++) {
+                COLORREF pv = TopDownPixel(pbits, g_ov.vw, x, y);
+                COLORREF ex = BottomUpPixel(ebits, ew, eh, x - offX, y - offY);
+                total++;
+                if (pv != ex) diff++;
+            }
+        }
+    }
+    printf("%s: compared %llu px, diff %llu (%.4f%%)\n", what,
+           (unsigned long long)total, (unsigned long long)diff,
+           total ? (double)diff * 100.0 / (double)total : 0.0);
+    TestCheck(total > 0 && diff == 0, what);
+}
+
 static void TestMosaic(HWND parent)
 {
     g_ov.hwnd = parent;
@@ -3281,20 +3347,27 @@ static void TestMosaic(HWND parent)
     g_ov.vw = 640; g_ov.vh = 480;
     g_ov.hasSel = TRUE;
     g_ov.state = ST_SELECTED;
-    g_ov.sel.left = 10;  g_ov.sel.top = 10;
+    /* 选区下移：尺寸标签会落在选区上方而不进入画面内容；
+     * 比对区域再向内缩 6px，避开 1px 选框和 8 个手柄 */
+    g_ov.sel.left = 10;  g_ov.sel.top = 60;
     g_ov.sel.right = 620; g_ov.sel.bottom = 400;
     g_tool = TOOL_MOVE;
 
     if (!OvAllocBuffers(g_ov.vw, g_ov.vh)) { TestCheck(FALSE, "mosaic: alloc buffers"); return; }
     FillTestPattern();
-    OvDimBuffers();
+    if (!OvDimBuffers()) {
+        TestCheck(FALSE, "mosaic: dim buffers");
+        FreeCapture();
+        g_ov.hwnd = NULL;
+        return;
+    }
     MosaicEpochBump();
 
-    /* 三条马赛克，都避开右下角工具条 */
+    /* 三条马赛克，全部落在比对区域内 */
     static const RECT rects[3] = {
-        {  40,  40, 180, 140 },
-        { 200,  40, 320, 120 },
-        { 360,  40, 480, 140 },
+        {  40,  80, 180, 180 },
+        { 200,  80, 320, 160 },
+        { 360,  80, 480, 180 },
     };
     g_annCount = 0;
     for (int i = 0; i < 3; i++) {
@@ -3358,29 +3431,22 @@ static void TestMosaic(HWND parent)
            (unsigned long long)dtCached, (unsigned long long)dtDirect);
     TestCheck(dtCached <= dtDirect, "mosaic cache is not slower than recompute");
 
-    /* 3) 预览和导出结果必须一致：重新走一次无缓存的导出，和缓存预览逐点比较 */
+    /* 3) 预览 vs 导出：选区内容逐像素比较，不做抽样。
+     *    先让导出路径自己重算一遍（不复用预览缓存），再整块比对。 */
     int sw = g_ov.sel.right - g_ov.sel.left;
     int sh = g_ov.sel.bottom - g_ov.sel.top;
     void *ebits = NULL;
-    MosaicEpochBump();                     /* 让导出路径自己重算 */
+    MosaicEpochBump();
     HBITMAP exp = BuildFinalBitmap(g_ov.sel.left, g_ov.sel.top, sw, sh, &ebits);
-    int mismatch = 0, samples = 0;
-    if (exp && ebits && prv && pbits) {
-        static const POINT pts[] = {
-            {  60,  60 }, { 120, 110 }, { 210,  60 },
-            { 300, 110 }, { 400,  70 }, { 470, 130 }
-        };
-        for (int i = 0; i < (int)(sizeof(pts) / sizeof(pts[0])); i++) {
-            COLORREF pv = TopDownPixel(pbits, g_ov.vw, pts[i].x, pts[i].y);
-            COLORREF ex = BottomUpPixel(ebits, sw, sh,
-                                        pts[i].x - g_ov.sel.left,
-                                        pts[i].y - g_ov.sel.top);
-            samples++;
-            if (pv != ex) mismatch++;
-        }
+    if (prv && pbits && exp && ebits) {
+        RECT area = { g_ov.sel.left + 6, g_ov.sel.top + 6,
+                      g_ov.sel.right - 6, g_ov.sel.bottom - 6 };
+        ComparePreviewVsExport(pbits, ebits, sw, sh, area,
+                               g_ov.sel.left, g_ov.sel.top,
+                               "mosaic preview == export (all pixels)");
+    } else {
+        TestCheck(FALSE, "mosaic preview == export (all pixels)");
     }
-    printf("mosaic: preview vs export %d/%d match\n", samples - mismatch, samples);
-    TestCheck(exp && ebits && samples == 6 && mismatch == 0, "mosaic preview == export");
     if (exp) DeleteObject(exp);
 
     /* 4) 撤销最后一条马赛克，原区域要还原成底图 */
@@ -3389,8 +3455,8 @@ static void TestMosaic(HWND parent)
     HBITMAP prv2 = RenderOverlayToDib(&pbits2);
     COLORREF after = 0, base = 0;
     if (prv2 && pbits2 && g_ov.pixCap) {
-        after = TopDownPixel(pbits2, g_ov.vw, 400, 70);
-        base  = TopDownPixel(g_ov.pixCap, g_ov.vw, 400, 70);
+        after = TopDownPixel(pbits2, g_ov.vw, 400, 120);
+        base  = TopDownPixel(g_ov.pixCap, g_ov.vw, 400, 120);
     }
     TestCheck(prv2 && after == base, "mosaic undo restores base pixels");
     if (prv)  DeleteObject(prv);
@@ -3399,6 +3465,202 @@ static void TestMosaic(HWND parent)
     g_annCount = 0;
     FreeCapture();
     g_ov.hwnd = NULL;
+}
+
+/* 测试用离屏画布：一块 top-down 32bpp DIB + 配套 DC */
+typedef struct { HDC dc; HBITMAP hbm; HGDIOBJ old; void *bits; } TestSurface;
+
+static void TestSurfaceDestroy(TestSurface *s)
+{
+    if (s->dc && s->old && s->old != (HGDIOBJ)HGDI_ERROR) SelectObject(s->dc, s->old);
+    if (s->dc)  DeleteDC(s->dc);
+    if (s->hbm) DeleteObject(s->hbm);
+    ZeroMemory(s, sizeof(*s));
+}
+
+static BOOL TestSurfaceCreate(TestSurface *s, int w, int h)
+{
+    ZeroMemory(s, sizeof(*s));
+
+    BITMAPINFO bi;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = w;
+    bi.bmiHeader.biHeight      = -h;
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    s->hbm = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, &s->bits, NULL, 0);
+    if (!s->hbm || !s->bits) goto fail;
+    s->dc = CreateCompatibleDC(NULL);
+    if (!s->dc) goto fail;
+    s->old = SelectObject(s->dc, s->hbm);
+    if (!s->old || s->old == (HGDIOBJ)HGDI_ERROR) goto fail;
+    return TRUE;
+
+fail:
+    TestSurfaceDestroy(s);
+    return FALSE;
+}
+
+/* 回归：拖动中被丢弃的窄马赛克不能留下可命中的缓存 */
+static void TestMosaicDiscard(HWND parent)
+{
+    g_ov.hwnd = parent;
+    g_ov.vx = 0; g_ov.vy = 0;
+    g_ov.vw = 640; g_ov.vh = 480;
+    g_ov.hasSel = TRUE;
+    g_ov.state = ST_SELECTED;
+    g_ov.sel.left = 10;  g_ov.sel.top = 60;
+    g_ov.sel.right = 620; g_ov.sel.bottom = 400;
+    g_tool = TOOL_MOSAIC;
+
+    if (!OvAllocBuffers(g_ov.vw, g_ov.vh)) { TestCheck(FALSE, "discard: alloc buffers"); return; }
+    FillTestPattern();
+    if (!OvDimBuffers()) {
+        TestCheck(FALSE, "discard: dim buffers");
+        FreeCapture();
+        g_ov.hwnd = NULL;
+        g_tool = TOOL_MOVE;
+        return;
+    }
+    g_annCount = 0;
+    MosaicEpochBump();
+    unsigned epoch0 = g_mosaicEpoch;
+
+    /* 走真实的鼠标消息链路：2px 宽的马赛克在拖动时会建缓存，
+     * 松手因为太窄被丢弃 */
+    SendMessageW(parent, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(100, 100));
+    SendMessageW(parent, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(102, 110));
+    SendMessageW(parent, WM_LBUTTONUP, 0, MAKELPARAM(102, 110));
+
+    printf("discard: annots=%d, epoch %u -> %u\n", g_annCount, epoch0, g_mosaicEpoch);
+    TestCheck(g_annCount == 0, "narrow mosaic discarded on mouse up");
+    TestCheck(g_mosaicEpoch != epoch0, "discard invalidates mosaic cache");
+
+    /* 同一下标再建一个正常马赛克：结果必须来自当前底图 */
+    SendMessageW(parent, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(100, 100));
+    SendMessageW(parent, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(180, 170));
+    SendMessageW(parent, WM_LBUTTONUP, 0, MAKELPARAM(180, 170));
+    TestCheck(g_annCount == 1 && g_ann[0].kind == AN_MOSAIC, "mosaic recreated at same index");
+
+    void *pbits = NULL, *ebits = NULL;
+    HBITMAP prv = RenderOverlayToDib(&pbits);
+    int sw = g_ov.sel.right - g_ov.sel.left;
+    int sh = g_ov.sel.bottom - g_ov.sel.top;
+    MosaicEpochBump();                     /* 导出不复用预览缓存 */
+    HBITMAP exp = BuildFinalBitmap(g_ov.sel.left, g_ov.sel.top, sw, sh, &ebits);
+    if (prv && pbits && exp && ebits) {
+        RECT area = { g_ov.sel.left + 6, g_ov.sel.top + 6,
+                      g_ov.sel.right - 6, g_ov.sel.bottom - 6 };
+        ComparePreviewVsExport(pbits, ebits, sw, sh, area,
+                               g_ov.sel.left, g_ov.sel.top,
+                               "discard regression matches current base");
+    } else {
+        TestCheck(FALSE, "discard regression matches current base");
+    }
+    if (prv) DeleteObject(prv);
+    if (exp) DeleteObject(exp);
+
+    if (GetCapture() == parent) ReleaseCapture();
+    g_annCount = 0;
+    FreeCapture();
+    g_ov.hwnd = NULL;
+    g_tool = TOOL_MOVE;
+}
+
+/* 缓存预算：扩容 / 缩容 / 超限 / 多区域 / 释放归零 / scratch 不计费 */
+static void TestMosaicBudget(void)
+{
+    g_ov.sel.left = 0;    g_ov.sel.top = 0;
+    g_ov.sel.right = 1600; g_ov.sel.bottom = 1200;
+    g_ov.hasSel = TRUE;
+
+    MosaicCacheFreeAll();
+    TestCheck(g_mosaicCachedPixels == 0, "budget: starts at zero");
+
+    TestSurface s;
+    if (!TestSurfaceCreate(&s, 1600, 1200)) { TestCheck(FALSE, "budget: surface"); return; }
+
+    g_annCount = 0;
+    Annot *a = &g_ann[g_annCount++];
+    ZeroMemory(a, sizeof(*a));
+    a->kind = AN_MOSAIC;
+
+    /* 1) 首次 100x100 */
+    a->rc.left = 10;  a->rc.top = 10;
+    a->rc.right = 110; a->rc.bottom = 110;
+    DrawAnnotations(s.dc);
+    TestCheck(g_mosaicCachedPixels == 10000 && g_mosaicCache[0].capW == 100,
+              "budget: first cache billed 100x100");
+
+    /* 2) 扩到 300x200：重新分配，按新尺寸计费 */
+    a->rc.right = 310; a->rc.bottom = 210;
+    DrawAnnotations(s.dc);
+    TestCheck(g_mosaicCachedPixels == 60000 && g_mosaicCache[0].capW == 300,
+              "budget: grow bills new size");
+
+    /* 3) 缩到 150x100：复用更大的画布，不重复计费 */
+    a->rc.right = 160; a->rc.bottom = 110;
+    DrawAnnotations(s.dc);
+    TestCheck(g_mosaicCachedPixels == 60000 && g_mosaicCache[0].capW == 300,
+              "budget: shrink reuses canvas without extra billing");
+
+    /* 4) 多区域：13 条 1200x1000 能进预算，第 14 条超预算退回 scratch */
+    g_annCount = 0;
+    int cached = 0;
+    for (int i = 0; i < 14; i++) {
+        Annot *m = &g_ann[g_annCount++];
+        ZeroMemory(m, sizeof(*m));
+        m->kind = AN_MOSAIC;
+        m->rc.left = i * 5;  m->rc.top = i * 5;
+        m->rc.right = m->rc.left + 1200;
+        m->rc.bottom = m->rc.top + 1000;
+        DrawAnnotations(s.dc);
+        if (g_mosaicCache[i].capW == 1200) cached++;
+    }
+    printf("budget: %d of 14 large mosaics cached, pixels=%llu, scratch.capW=%d\n",
+           cached, (unsigned long long)g_mosaicCachedPixels, g_mosaicScratch.capW);
+    TestCheck(cached == 13, "budget: 13 large regions fit, 14th rejected");
+    TestCheck(g_mosaicCachedPixels == (size_t)cached * 1200u * 1000u,
+              "budget: accounting matches cached slots");
+    TestCheck(g_mosaicScratch.capW == 1200, "budget: over-budget region uses scratch");
+    TestCheck(g_mosaicCachedPixels <= (size_t)MOSAIC_CACHE_BUDGET,
+              "budget: total never exceeds limit");
+    /* scratch 已占 1200x1000，但上面的等式只统计正式槽位，
+     * 说明 scratch 没有混进预算 */
+
+    /* 5) 全部释放后统计归零 */
+    MosaicCacheFreeAll();
+    TestCheck(g_mosaicCachedPixels == 0, "budget: free all returns to zero");
+    TestCheck(g_mosaicScratch.capW == 0, "budget: scratch released");
+
+    /* 6) 单条超过 8M 像素：不缓存，只用 scratch，不计费 */
+    TestSurface big;
+    if (TestSurfaceCreate(&big, 2900, 2900)) {
+        g_annCount = 0;
+        Annot *m = &g_ann[g_annCount++];
+        ZeroMemory(m, sizeof(*m));
+        m->kind = AN_MOSAIC;
+        m->rc.left = 0; m->rc.top = 0;
+        m->rc.right = 2900; m->rc.bottom = 2900;     /* 8.41M 像素 > 8M 上限 */
+        DrawAnnotations(big.dc);
+        printf("budget: oversize -> slot.capW=%d scratch.capW=%d pixels=%llu\n",
+               g_mosaicCache[0].capW, g_mosaicScratch.capW,
+               (unsigned long long)g_mosaicCachedPixels);
+        TestCheck(g_mosaicCache[0].capW == 0, "budget: single region over 8M not cached");
+        TestCheck(g_mosaicScratch.capW == 2900, "budget: oversize single region uses scratch");
+        TestCheck(g_mosaicCachedPixels == 0, "budget: scratch is not billed");
+        TestSurfaceDestroy(&big);
+    } else {
+        printf("[SKIP] budget: 2900x2900 surface unavailable\n");
+    }
+
+    TestSurfaceDestroy(&s);
+    g_annCount = 0;
+    MosaicCacheFreeAll();
+    TestCheck(g_mosaicCachedPixels == 0, "budget: zero after cleanup");
 }
 
 static void TestClipboard(void)
@@ -3423,14 +3685,18 @@ static volatile LONG g_clipHeld = 0;
 static DWORD WINAPI ClipboardBlockerThread(LPVOID unused)
 {
     (void)unused;
-    if (OpenClipboard(NULL)) {
-        InterlockedExchange(&g_clipHeld, 1);
-        SetEvent(g_clipHold);
-        WaitForSingleObject(g_clipRelease, INFINITE);
-        CloseClipboard();
-    } else {
-        SetEvent(g_clipHold);
+    /* 外部剪贴板管理器可能短暂占用，重试几次再判定失败 */
+    for (int i = 0; i < 20; i++) {
+        if (OpenClipboard(NULL)) {
+            InterlockedExchange(&g_clipHeld, 1);
+            SetEvent(g_clipHold);
+            WaitForSingleObject(g_clipRelease, INFINITE);
+            CloseClipboard();
+            return 0;
+        }
+        Sleep(20);
     }
+    SetEvent(g_clipHold);
     return 0;
 }
 
@@ -3518,7 +3784,7 @@ static DWORD WINAPI HotkeyBlockerThread(LPVOID unused)
     (void)unused;
     HWND w = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 0, 0,
                              HWND_MESSAGE, NULL, NULL, NULL);
-    if (w && RegisterHotKey(w, 0xBEEF, MOD_CONTROL | MOD_ALT, 'S')) {
+    if (w && RegisterHotKey(w, 0xBEEF, MOD_CONTROL | MOD_ALT, VK_F11)) {
         InterlockedExchange(&g_hkBlocked, 1);
         SetEvent(g_hkReady);
         WaitForSingleObject(g_hkRelease, INFINITE);
@@ -3535,14 +3801,19 @@ static void TestHotkey(void)
     g_hotkeyId = 0;
     g_hotkeyOk = FALSE;
     g_mods = MOD_CONTROL | MOD_ALT;
-    g_vk   = 'A';
+    g_vk   = VK_F9;
 
-    if (!HotkeyTryApply(MOD_CONTROL | MOD_ALT, 'A')) {
-        TestCheck(FALSE, "hotkey: initial register Ctrl+Alt+A");
-        return;
+    /* 用功能键而不是 Ctrl+Alt+A：避免和正在运行的真实 QuickShot 实例抢热键，
+     * 否则测试会因环境占用而失败（测的是切换逻辑，不是某个具体组合）。 */
+    if (!HotkeyTryApply(g_mods, g_vk)) {
+        g_vk = VK_F10;
+        if (!HotkeyTryApply(g_mods, g_vk)) {
+            TestCheck(FALSE, "hotkey: initial register");
+            return;
+        }
     }
     UINT idBefore = g_hotkeyId;
-    int aM = MOD_CONTROL | MOD_ALT, aV = 'A';
+    UINT aM = g_mods, aV = g_vk;
 
     g_hkReady   = CreateEventW(NULL, TRUE, FALSE, NULL);
     g_hkRelease = CreateEventW(NULL, TRUE, FALSE, NULL);
@@ -3557,12 +3828,12 @@ static void TestHotkey(void)
 
     if (InterlockedCompareExchange(&g_hkBlocked, 1, 1) == 1) {
         /* 新组合被占用：必须失败，且旧热键、旧配置都不能动 */
-        BOOL switched = HotkeyTryApply(MOD_CONTROL | MOD_ALT, 'S');
+        BOOL switched = HotkeyTryApply(MOD_CONTROL | MOD_ALT, VK_F11);
         TestCheck(!switched, "occupied hotkey rejected");
-        TestCheck(g_mods == (UINT)aM && g_vk == (UINT)aV && g_hotkeyId == idBefore,
+        TestCheck(g_mods == aM && g_vk == aV && g_hotkeyId == idBefore,
                   "old hotkey kept after failed switch");
 
-        TestCheck(HotkeyTryApply(MOD_CONTROL | MOD_SHIFT, 'A'), "switch to free hotkey works");
+        TestCheck(HotkeyTryApply(MOD_CONTROL | MOD_SHIFT, VK_F12), "switch to free hotkey works");
 
         SetEvent(g_hkRelease);
         WaitForSingleObject(g_hkThread, 3000);
@@ -3571,9 +3842,9 @@ static void TestHotkey(void)
         CloseHandle(g_hkRelease);
         g_hkThread = NULL; g_hkReady = g_hkRelease = NULL;
 
-        TestCheck(HotkeyTryApply(MOD_CONTROL | MOD_ALT, 'S'), "released combo can be applied");
+        TestCheck(HotkeyTryApply(MOD_CONTROL | MOD_ALT, VK_F11), "released combo can be applied");
     } else {
-        printf("[SKIP] hotkey conflict: Ctrl+Alt+S already taken by another app\n");
+        printf("[SKIP] hotkey conflict: Ctrl+Alt+F11 already taken by another app\n");
         SetEvent(g_hkRelease);
         WaitForSingleObject(g_hkThread, 3000);
         CloseHandle(g_hkThread);
@@ -3600,7 +3871,11 @@ static void WarmUpAll(HWND overlay)
 
     if (!OvAllocBuffers(g_ov.vw, g_ov.vh)) { g_ov.hwnd = NULL; return; }
     FillTestPattern();
-    OvDimBuffers();
+    if (!OvDimBuffers()) {
+        FreeCapture();
+        g_ov.hwnd = NULL;
+        return;
+    }
 
     g_annCount = 0;
     Annot *a = &g_ann[g_annCount++];
@@ -3647,6 +3922,8 @@ static int RunStabilityTest(void)
     printf("  gdi after text: %lu\n", GdiCount());
     TestMosaic(overlay);
     printf("  gdi after mosaic: %lu\n", GdiCount());
+    TestMosaicDiscard(overlay);
+    TestMosaicBudget();
     TestClipboard();
     TestClipboardBusy();
     TestFileNames();
