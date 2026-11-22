@@ -622,5 +622,124 @@ GDI 数量：`32 -> 25`；截图 1000 次 `32 → 32`；文字 1000 次 `38 → 
 | 2 | 进程被强杀 | 队列与进程同归于尽，属预期，无法在进程内补救 |
 | 3 | `DeleteObject` 对已选入对象返回 TRUE 的延迟释放 | 由 GDI 在 DC 解引用后完成，本程序无法感知；`GetObjectType` 在回收前仍返回类型，测试已改用 GDI 总量判定 |
 
+---
+
+## 11. 收尾轮（`v1.1.4`）：释放结果枚举化 + 会话保留表
+
+基线：`94e4379`。
+
+### 11.1 根因
+
+前一版 `GdiRelease()` 用 `BOOL` 表达释放结果：队列满时只做“再删一次”，失败就 `lost++` 后返回 `FALSE`。
+问题在于：
+
+1. `BOOL` 无法区分「已释放」「已托管」「仍归调用方」，调用方只能凭猜测；
+2. 返回 `FALSE` 后句柄既不在队列、也不在调用方，**没有持有记录**；
+3. 十几个绘制调用点直接忽略返回值，失败路径等于无人负责。
+
+### 11.2 新所有权模型
+
+[`shot.c#L296-L470`](file:///C:/code/quickshot/shot.c#L296-L470)（托管结构）、[`shot.c#L528-L587`](file:///C:/code/quickshot/shot.c#L528-L587)（`GdiRelease`）
+
+```c
+typedef enum {
+    GdiRelFreed = 0,      /* 已确认删除，调用方无需再管 */
+    GdiRelDeferred,       /* 延迟释放队列持有 */
+    GdiRelHeldBySession,  /* 队列满，会话保留表持有 */
+    GdiRelUnreleased      /* 未释放也未托管：所有权仍在调用方 */
+} GdiReleaseStatus;
+```
+
+两级静态托管（无 malloc）：
+
+| 级别 | 存储 | 生命周期 | 作用 |
+|---|---|---|---|
+| 一级 | `g_gdiDefer[64]` | 进程级 | 常规托管；满时先驱逐已可释放条目 |
+| 二级 | `g_gdiSessionHeld[8]` | 截屏会话级 | 队列满时接管，DC 销毁后随会话统一 flush |
+
+- 两级都登记成功时，句柄在**调用方函数返回后**仍存在于静态表中，是可达的持有记录；
+- 只有两级都满才返回 `GdiRelUnreleased`，此时所有权明确留在调用方，调用方必须自行持有；
+- 所有托管结构只在 `DeleteObject` 成功（或对象已不存在）后放弃句柄；
+- 任何一级都不会销毁 DC。
+
+### 11.3 调用点处理
+
+| 调用点 | 处理方式 |
+|---|---|
+| `DrawPenStroke` / `DrawEllipseAnnot` / `DrawRectAnnot` / `DrawArrowAnnot` / `DrawNumberAnnot` / `DrawTextAnnot` / `TextAnnotRect` | 统一走 [`GdiReleaseInPaint()`](file:///C:/code/quickshot/shot.c#L589-L599)：`GdiRelUnreleased` 时计数 `g_gdiUnreleasedInPaint` 并写 ERROR，自检断言为 0 |
+| `TestGdiLifecycle` "release fallback" | 断言 `GdiRelFreed` 且 `g_gdiRestoreFailures` 增加（恢复失败与句柄归属分开表达） |
+| 1000 次字体/画笔循环 | 断言每次都是 `GdiRelFreed`，否则计入失败 |
+| `TestGdiDeferredRelease` | 断言注入删不掉时返回 `GdiRelDeferred` |
+| `TestGdiDeferredCapacity` | 队列满时走真实 `GdiRelease`，断言返回 `GdiRelHeldBySession` |
+| `TestGdiDeferredOwnership` / `Duplicate` | 直接断言托管表状态与释放次数 |
+
+### 11.4 真实调用链故障注入（本轮核心测试）
+
+`TestGdiDeferredCapacity`：
+
+1. 用 64 个独立 DC 各选入一支画笔，把延迟队列填到 64/64；
+2. 再建第 65 个 DC + 画笔，构造“仍被 DC 引用”的对象；
+3. **通过真实 `GdiRelease()`** 释放它，并注入 132 次删除失败，覆盖
+   「入口 flush（64）＋ 本次删除（1）＋ 队列满后的驱逐扫描（64）」；
+4. 断言返回 `GdiRelHeldBySession`、会话表恰好 +1、队列仍为 64；
+5. 销毁全部 DC → flush → 队列与会话表都归零，64 个对象全部释放。
+
+实测：
+
+```text
+defer cap: made=64 queued=64 rejected=0
+defer cap: 65th status=2 queue=64 session=1
+[PASS] defer cap: overflow goes to session table
+[PASS] defer cap: 65th handle is reachable in session
+[PASS] defer cap: queue-full handoff is counted
+[PASS] defer cap: queue stays within bounds
+defer cap: after dc destroy queued=0 session=0 freed=64
+[PASS] defer cap: queue drained
+[PASS] defer cap: session table drained
+[PASS] defer cap: queue release count matches
+[PASS] defer cap: registration works again after drain
+```
+
+`status=2` 即 `GdiRelHeldBySession`；整个运行结束时 `queue=0 session=0 unreleased=0 paintUnreleased=0`。
+
+### 11.5 退出清理语义
+
+[`GdiDeferReleaseAll()`](file:///C:/code/quickshot/shot.c#L447-L467)：
+
+1. 先 `GdiFlushDeferred()` 做最后一次重试；
+2. 不把“仍在等待”的对象当作已释放，也不在报告前把它们从记录里删掉；
+3. 逐条输出残留句柄与 `GetObjectType` 类型，并分别给出 queue/session 的数量；
+4. 汇总 `freed (queue) + freed (session), evicted, rejected, unreleased` 四个口径；
+5. 正式退出（`WinMain`）与自检退出走同一函数、同一顺序：先销毁 DC 与全局对象，再调用它。
+
+### 11.6 回归结果
+
+| 命令 | 退出码 | 结果 |
+|---|---|---|
+| `--stress-test` | 0 | **119 PASS / 0 FAIL** |
+| `--capture-test` | 0 | 2560×1440、`png: ok`、热键可用 |
+| `--toolbar-test` | 0 | `out-of-bounds: 0`、`cursor mismatches: 0` |
+| `--demo` | 0 | SHA256 `A8D9086C…28F2`，逐字节未变 |
+
+```text
+capture: 1000x gdi 35 -> 35
+text:    1000x gdi 41 -> 41
+font loop 1000x gdi 37 -> 37
+pen loop  1000x gdi 37 -> 38 -> 38
+=== gdi total: 35 -> 31 ===
+=== gdi failures: select=4 restore=108 release=3 | queue=0 session=0 freed=108+1 evicted=0 rejected=1 unreleased=0 paintUnreleased=0 (slots 64+8) ===
+```
+
+`-Wall` 无新增告警；正常渲染阶段三个失败计数均为 0。
+
+### 11.7 仍然存在的丢失路径
+
+| # | 路径 | 说明 |
+|---|---|---|
+| 1 | 64 队列 + 8 会话同时占满 | 返回 `GdiRelUnreleased`，所有权在调用方；绘制路径会计入 `g_gdiUnreleasedInPaint` 并由自检断言为 0。正常操作不可达（需 72 个对象同时被 DC 锁住） |
+| 2 | 进程被强杀 | 静态托管表随进程消失，属预期 |
+| 3 | GDI 对已选入对象的延迟删除 | 由系统在 DC 解引用后完成，无法在进程内提前感知 |
+
+
 
 

@@ -293,44 +293,51 @@ static int g_gdiSelectFailures;
 static int g_gdiRestoreFailures;
 static int g_gdiReleaseFailures;
 
-/* 延迟释放队列（静态预留，全程不依赖动态分配）。
+/* ---------------------------------------------------------------- 临时 GDI 对象托管
  *
  * 场景：恢复原对象失败、stock 顶出也失败时，临时对象仍被某些 DC 引用，
- * 此时 DeleteObject 必然失败。句柄不能丢——登记到这里，等引用它的 DC 销毁后重试。
+ * 此时 DeleteObject 可能失败。句柄必须有一个“调用方返回后仍然可达”的持有记录，
+ * 因此采用两级静态托管（全程不使用 malloc/realloc）：
  *
- * 为什么不再用动态数组：
- *   realloc 失败时没有任何可靠办法接管句柄，只能“丢”或“再挖一块内存”，两者都不成立。
- *   改成固定预留后，扩容失败、翻倍溢出、分配尺寸计算三类风险整体消失。
+ *   一级 延迟释放队列 g_gdiDefer[64]
+ *       常驻托管区。满了先驱逐“现在已经能删掉”的条目腾位置。
+ *   二级 会话保留表 g_gdiSessionHeld[8]
+ *       队列满时接管，记录挂在当前截屏会话名下（随 g_ov 生命周期存在），
+ *       会话 DC 销毁后由 GdiFlushDeferred() 统一重试。
  *
- * 容量为什么够：
- *   一个对象只有在“仍被某个 DC 引用”时才删不掉；每个 DC 同时最多持有一个画笔、
- *   一个画刷、一个字体，而本程序同时存活的 DC（截屏 3 + 马赛克缓存 32 + 临时 DC）
- *   加上测试画布也远小于 64/3。真到满的时候先驱逐“已经能删掉”的条目腾位置。
+ * 两级都满时 GdiRelease 返回 GdiRelUnreleased，所有权明确留在调用方；
+ * 调用方必须显式处理这个状态（自检会断言正常路径为 0）。
  *
  * 所有权契约：
- *   1. GdiDeferRetain() 返回 TRUE → 句柄所有权转移给队列，调用方不得再释放；
- *   2. 返回 FALSE → 所有权仍归调用方，调用方必须自行处理（GdiRelease 会重试删除，
- *      并如实返回失败，绝不假装成功）；
- *   3. 队列只在 DeleteObject 成功（或对象已不存在）后放弃该句柄；
- *   4. 队列从不销毁任何 DC。
+ *   - 返回 GdiRelFreed / GdiRelDeferred / GdiRelHeldBySession → 句柄已不由调用方负责；
+ *   - 返回 GdiRelUnreleased → 句柄仍归调用方，且没有被任何托管结构记录；
+ *   - 托管结构只在 DeleteObject 成功（或对象已不存在）后才放弃句柄；
+ *   - 任何一级都不会销毁 DC。
  */
-#define GDI_DEFER_SLOTS 64
+typedef enum {
+    GdiRelFreed = 0,        /* 已确认删除（或对象本来就不存在） */
+    GdiRelDeferred,         /* 已由延迟释放队列接管 */
+    GdiRelHeldBySession,    /* 队列满，已由会话保留表接管 */
+    GdiRelUnreleased        /* 未释放也未托管：所有权仍在调用方 */
+} GdiReleaseStatus;
+
+#define GDI_DEFER_SLOTS    64
+#define GDI_SESSION_SLOTS   8
+
 static HGDIOBJ g_gdiDefer[GDI_DEFER_SLOTS];
 static int     g_gdiDeferCount;
-static int     g_gdiDeferDone;       /* 队列里最终成功释放的数量 */
+static int     g_gdiDeferDone;       /* 托管区里最终成功释放的数量 */
 static int     g_gdiDeferEvicted;    /* 满时驱逐（顺带释放）的数量 */
-static int     g_gdiDeferRejected;   /* 无槽可给、所有权退回调用方的次数 */
-static int     g_gdiDeferLostHandles;/* 退回后重试仍失败、确实无法释放的次数 */
+static int     g_gdiDeferRejected;   /* 队列满、转交会话保留表的次数 */
 
-static BOOL GdiDeferContains(HGDIOBJ obj)
-{
-    for (int i = 0; i < g_gdiDeferCount; i++)
-        if (g_gdiDefer[i] == obj) return TRUE;
-    return FALSE;
-}
+static HGDIOBJ g_gdiSessionHeld[GDI_SESSION_SLOTS];
+static int     g_gdiSessionCount;
+static int     g_gdiSessionDone;     /* 会话保留表里最终成功释放的数量 */
+
+static int g_gdiDeferLostHandles;    /* 两级都满、所有权退回调用方的次数 */
 
 /* 统一的“尝试删除”入口：自检可注入失败，正常路径等价于 DeleteObject。
- * 队列的 flush/evict 与 GdiRelease 都走这里，保证注入时行为一致。 */
+ * 队列/会话/驱逐/GdiRelease 全部走这里，保证注入时行为一致。 */
 static BOOL GdiTryDelete(HGDIOBJ obj)
 {
     if (!obj) return TRUE;
@@ -341,7 +348,16 @@ static BOOL GdiTryDelete(HGDIOBJ obj)
     return DeleteObject(obj) ? TRUE : FALSE;
 }
 
-/* 尝试删掉已经可以释放的条目，腾出槽位；返回是否还有空位 */
+static BOOL GdiDeferContains(HGDIOBJ obj)
+{
+    for (int i = 0; i < g_gdiDeferCount; i++)
+        if (g_gdiDefer[i] == obj) return TRUE;
+    for (int i = 0; i < g_gdiSessionCount; i++)
+        if (g_gdiSessionHeld[i] == obj) return TRUE;
+    return FALSE;
+}
+
+/* 尝试删掉队列里已经可以释放的条目，腾出槽位；返回是否还有空位 */
 static BOOL GdiDeferEvict(void)
 {
     int i = 0;
@@ -362,29 +378,38 @@ static BOOL GdiDeferEvict(void)
     return g_gdiDeferCount < GDI_DEFER_SLOTS;
 }
 
-/* 登记一个暂时删不掉的对象；返回 TRUE 表示所有权已转移给队列 */
+/* 一级：登记到延迟释放队列；返回 FALSE 表示队列确实满了（已尝试驱逐） */
 static BOOL GdiDeferRetain(HGDIOBJ obj)
 {
     if (!obj) return TRUE;
 
     if (GdiDeferContains(obj)) {         /* 去重：同一句柄只登记一次 */
-        QSLog("GdiDeferRetain: obj=%p 已在队列中，忽略重复登记", (void *)obj);
+        QSLog("GdiDeferRetain: obj=%p 已在托管区，忽略重复登记", (void *)obj);
         return TRUE;
     }
 
-    /* 边界：只允许写 [0, GDI_DEFER_SLOTS)，不做任何乘法/翻倍计算 */
-    if (g_gdiDeferCount >= GDI_DEFER_SLOTS && !GdiDeferEvict()) {
-        g_gdiDeferRejected++;
-        QSLog("GdiDeferRetain: ERROR 预留槽已满（%d），obj=%p 所有权退回调用方",
-              GDI_DEFER_SLOTS, (void *)obj);
+    /* 边界：只允许写 [0, GDI_DEFER_SLOTS) */
+    if (g_gdiDeferCount >= GDI_DEFER_SLOTS && !GdiDeferEvict())
         return FALSE;
-    }
 
     g_gdiDefer[g_gdiDeferCount++] = obj;
     return TRUE;
 }
 
-/* 尝试释放队列里已经可以删的对象。
+/* 二级：会话保留表接管；返回 FALSE 表示两级都满 */
+static BOOL GdiSessionRetain(HGDIOBJ obj)
+{
+    if (!obj) return TRUE;
+    if (GdiDeferContains(obj)) return TRUE;
+
+    if (g_gdiSessionCount >= GDI_SESSION_SLOTS) return FALSE;
+
+    g_gdiSessionHeld[g_gdiSessionCount++] = obj;
+    QSLog("GdiSessionRetain: 队列已满，obj=%p 转由会话保留表接管", (void *)obj);
+    return TRUE;
+}
+
+/* 尝试释放所有托管对象（队列 + 会话保留表）。
  * 不主动销毁任何 DC：只对“已不再被任何 DC 引用”的条目重试 DeleteObject。 */
 static void GdiFlushDeferred(void)
 {
@@ -396,26 +421,49 @@ static void GdiFlushDeferred(void)
         if (!gone && GdiTryDelete(obj)) {
             gone = TRUE;
             g_gdiDeferDone++;
-            QSLog("GdiFlushDeferred: 延迟对象 obj=%p 已释放", (void *)obj);
+            QSLog("GdiFlushDeferred: 队列对象 obj=%p 已释放", (void *)obj);
         }
 
         if (gone) g_gdiDefer[i] = g_gdiDefer[--g_gdiDeferCount];
         else      i++;
     }
+
+    i = 0;
+    while (i < g_gdiSessionCount) {
+        HGDIOBJ obj = g_gdiSessionHeld[i];
+        BOOL gone = (!obj || GetObjectType(obj) == 0);
+
+        if (!gone && GdiTryDelete(obj)) {
+            gone = TRUE;
+            g_gdiSessionDone++;
+            QSLog("GdiFlushDeferred: 会话保留对象 obj=%p 已释放", (void *)obj);
+        }
+
+        if (gone) g_gdiSessionHeld[i] = g_gdiSessionHeld[--g_gdiSessionCount];
+        else      i++;
+    }
 }
 
-/* 进程退出时调用：此时业务窗口与 DC 都已销毁，再试一次，
- * 然后报告残留并清空队列状态（队列是静态存储，无需 free）。 */
+/* 进程退出时调用：业务窗口与 DC 都已销毁，做最后一次重试，然后如实报告。
+ * 不把“仍在等待”的对象当成已释放，也不在报告前把它们从记录里抹掉。 */
 static void GdiDeferReleaseAll(void)
 {
     GdiFlushDeferred();
 
-    if (g_gdiDeferCount > 0) {
+    int waiting = g_gdiDeferCount + g_gdiSessionCount;
+    if (waiting > 0) {
+        QSLog("GdiDeferReleaseAll: 退出时仍有 %d 个对象等待释放（queue=%d session=%d）",
+              waiting, g_gdiDeferCount, g_gdiSessionCount);
         for (int i = 0; i < g_gdiDeferCount; i++)
-            QSLog("GdiDeferReleaseAll: 退出时仍未释放 obj=%p type=%lu",
+            QSLog("  仍在等待: obj=%p type=%lu (queue)",
                   (void *)g_gdiDefer[i], (unsigned long)GetObjectType(g_gdiDefer[i]));
+        for (int i = 0; i < g_gdiSessionCount; i++)
+            QSLog("  仍在等待: obj=%p type=%lu (session)",
+                  (void *)g_gdiSessionHeld[i], (unsigned long)GetObjectType(g_gdiSessionHeld[i]));
     }
-    g_gdiDeferCount = 0;
+    QSLog("GdiDeferReleaseAll: freed=%d (queue) + %d (session), evicted=%d, rejected=%d, unreleased=%d",
+          g_gdiDeferDone, g_gdiSessionDone, g_gdiDeferEvicted,
+          g_gdiDeferRejected, g_gdiDeferLostHandles);
 }
 
 static BOOL GdiSelect(HDC hdc, HGDIOBJ obj, HGDIOBJ *old)
@@ -479,13 +527,19 @@ static BOOL GdiRestore(HDC hdc, HGDIOBJ old, const char *ctx)
 
 /* 临时对象的标准释放流程。顺序是有意这样排的：
  *   1. 先恢复原对象；
- *   2. 恢复失败说明临时对象可能仍被 DC 引用——这时直接 DeleteObject 会静默失败，
- *      所以先用同类 stock 对象把它顶出 DC（stockFallback=-1 表示无替代，如 HBITMAP）；
+ *   2. 恢复失败说明临时对象可能仍被 DC 引用，先用同类 stock 对象把它顶出 DC
+ *      （stockFallback=-1 表示无替代，如 HBITMAP）；
  *   3. 删除临时对象并检查结果；
- *   4. 若顶出与删除都失败，把「对象 + 所属 DC」放进延迟队列，绝不丢失句柄，
- *      等该 DC 销毁后由 GdiFlushDeferred() 重试释放。
- * 返回值 TRUE 仅表示“原对象已恢复且临时对象已删除”，其余情况一律 FALSE。 */
-static BOOL GdiRelease(HDC hdc, HGDIOBJ obj, HGDIOBJ old, int stockFallback, const char *ctx)
+ *   4. 删不掉时按两级托管接管：延迟队列 → 会话保留表；
+ *   5. 两级都满才返回 GdiRelUnreleased，把所有权明确交还调用方。
+ *
+ * 返回值表示句柄的最终归属，不能只用一个 BOOL 概括：
+ *   GdiRelFreed          已删除，调用方无需再管；
+ *   GdiRelDeferred       延迟队列持有；
+ *   GdiRelHeldBySession  会话保留表持有（队列已满）；
+ *   GdiRelUnreleased     未释放也未托管，调用方必须继续持有。 */
+static GdiReleaseStatus GdiRelease(HDC hdc, HGDIOBJ obj, HGDIOBJ old,
+                                   int stockFallback, const char *ctx)
 {
     GdiFlushDeferred();                     /* 顺手清理之前排队、现在已能释放的对象 */
 
@@ -502,33 +556,46 @@ static BOOL GdiRelease(HDC hdc, HGDIOBJ obj, HGDIOBJ old, int stockFallback, con
                   ctx, (void *)obj);
     }
 
-    BOOL deleted = TRUE;
+    GdiReleaseStatus st = GdiRelFreed;
+
     if (obj) {
-        deleted = GdiTryDelete(obj);
-        if (!deleted)
-            QSLog("GdiRelease(%s): DeleteObject 失败 obj=%p（可能仍被 DC 引用）", ctx, (void *)obj);
-        if (!deleted) {
-            /* 句柄不能丢：登记成功即由队列持有，调用方不得再释放 */
+        if (GdiTryDelete(obj)) {
+            st = GdiRelFreed;
+        } else {
+            QSLog("GdiRelease(%s): 删除失败 obj=%p（仍被 DC 引用）", ctx, (void *)obj);
+
             if (GdiDeferRetain(obj)) {
+                st = GdiRelDeferred;
                 QSLog("GdiRelease(%s): obj=%p 已转入延迟释放队列", ctx, (void *)obj);
+            } else if (GdiSessionRetain(obj)) {
+                st = GdiRelHeldBySession;
+                g_gdiDeferRejected++;
+                QSLog("GdiRelease(%s): 队列已满，obj=%p 由会话保留表接管", ctx, (void *)obj);
             } else {
-                /* 契约：登记失败时所有权仍在调用方手里。
-                 * 这里做最后一次尝试——DC 状态可能已经变化，删除也许正好成功；
-                 * 仍然失败就明确计数并写 ERROR，绝不假装成功。 */
-                if (GdiTryDelete(obj)) {
-                    deleted = TRUE;
-                    QSLog("GdiRelease(%s): obj=%p 登记失败后重试删除成功", ctx, (void *)obj);
-                } else {
-                    g_gdiDeferLostHandles++;
-                    QSLog("GdiRelease(%s): ERROR obj=%p 既无法删除也无法登记（DC 仍引用）",
-                          ctx, (void *)obj);
-                }
+                /* 两级都满：所有权明确留在调用方，绝不假装成功。
+                 * 调用方拿到 GdiRelUnreleased 后必须自行持有该句柄。 */
+                st = GdiRelUnreleased;
+                g_gdiDeferLostHandles++;
+                QSLog("GdiRelease(%s): ERROR obj=%p 未释放也未托管（队列与会话表均满）",
+                      ctx, (void *)obj);
             }
         }
     }
 
-    if (!(restored && deleted)) g_gdiReleaseFailures++;
-    return restored && deleted;
+    if (!restored || st == GdiRelUnreleased) g_gdiReleaseFailures++;
+    return st;
+}
+
+static int g_gdiUnreleasedInPaint;   /* 绘制路径遇到 GdiRelUnreleased 的次数，正常应为 0 */
+
+/* 绘制路径的释放封装：绘制函数不承担复杂恢复逻辑，只把“未能托管”的极端情况
+ * 显式计数并记录，由自检断言正常路径为 0，而不是静默忽略。 */
+static void GdiReleaseInPaint(HDC hdc, HGDIOBJ obj, HGDIOBJ old, int stock, const char *ctx)
+{
+    if (GdiRelease(hdc, obj, old, stock, ctx) == GdiRelUnreleased) {
+        g_gdiUnreleasedInPaint++;
+        QSLog("GdiReleaseInPaint(%s): ERROR obj=%p 未释放也未托管", ctx, (void *)obj);
+    }
 }
 
 /* ---------------------------------------------------------------- 配置 */
@@ -798,7 +865,7 @@ static void DrawPenStroke(HDC hdc, const Annot *a)
     HGDIOBJ old = NULL;
     if (!GdiSelect(hdc, pen, &old)) { if (pen) DeleteObject(pen); return; }
     Polyline(hdc, a->pts, a->npts);
-    GdiRelease(hdc, pen, old, NULL_PEN, "pen stroke");
+    GdiReleaseInPaint(hdc, pen, old, NULL_PEN, "pen stroke");
 }
 
 static void DrawEllipseAnnot(HDC hdc, const Annot *a)
@@ -811,7 +878,7 @@ static void DrawEllipseAnnot(HDC hdc, const Annot *a)
         Ellipse(hdc, a->rc.left, a->rc.top, a->rc.right, a->rc.bottom);
         GdiRestore(hdc, oldBr, "ellipse brush");
     }
-    GdiRelease(hdc, pen, oldPen, NULL_PEN, "ellipse pen");
+    GdiReleaseInPaint(hdc, pen, oldPen, NULL_PEN, "ellipse pen");
 }
 
 static void DrawRectAnnot(HDC hdc, const Annot *a)
@@ -824,7 +891,7 @@ static void DrawRectAnnot(HDC hdc, const Annot *a)
         Rectangle(hdc, a->rc.left, a->rc.top, a->rc.right, a->rc.bottom);
         GdiRestore(hdc, oldBr, "rect brush");
     }
-    GdiRelease(hdc, pen, oldPen, NULL_PEN, "rect pen");
+    GdiReleaseInPaint(hdc, pen, oldPen, NULL_PEN, "rect pen");
 }
 
 static void DrawArrowAnnot(HDC hdc, const Annot *a)
@@ -860,12 +927,12 @@ static void DrawArrowAnnot(HDC hdc, const Annot *a)
             Polygon(hdc, head, 3);
             GdiRestore(hdc, oldNullPen, "arrow null pen");
         }
-        GdiRelease(hdc, br, oldBr, WHITE_BRUSH, "arrow brush");
+        GdiReleaseInPaint(hdc, br, oldBr, WHITE_BRUSH, "arrow brush");
     } else if (br) {
         DeleteObject(br);                  /* 没选入 DC，直接删 */
     }
 
-    GdiRelease(hdc, pen, oldPen, NULL_PEN, "arrow pen");
+    GdiReleaseInPaint(hdc, pen, oldPen, NULL_PEN, "arrow pen");
 }
 
 /* 马赛克：把目标区域切块、逐块取平均色涂平。
@@ -1058,7 +1125,7 @@ static void DrawNumberAnnot(HDC hdc, const Annot *a)
             Ellipse(hdc, r.left, r.top, r.right, r.bottom);
             GdiRestore(hdc, oldPen, "number circle null pen");
         }
-        GdiRelease(hdc, br, oldBr, WHITE_BRUSH, "number circle brush");
+        GdiReleaseInPaint(hdc, br, oldBr, WHITE_BRUSH, "number circle brush");
     } else if (br) {
         DeleteObject(br);
     }
@@ -1075,7 +1142,7 @@ static void DrawNumberAnnot(HDC hdc, const Annot *a)
         DrawTextW(hdc, a->text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SetTextColor(hdc, oldTc);
         SetBkMode(hdc, oldBk);
-        GdiRelease(hdc, f, oldF, DEFAULT_GUI_FONT, "number font");
+        GdiReleaseInPaint(hdc, f, oldF, DEFAULT_GUI_FONT, "number font");
     } else {
         DeleteObject(f);
     }
@@ -1097,7 +1164,7 @@ static void DrawTextAnnot(HDC hdc, const Annot *a)
         DrawTextW(hdc, a->text, -1, &r, DT_LEFT | DT_TOP | DT_NOCLIP | DT_SINGLELINE);
         SetTextColor(hdc, oldTc);
         SetBkMode(hdc, oldBk);
-        GdiRelease(hdc, f, oldF, DEFAULT_GUI_FONT, "text font");
+        GdiReleaseInPaint(hdc, f, oldF, DEFAULT_GUI_FONT, "text font");
     } else {
         DeleteObject(f);
     }
@@ -2156,7 +2223,7 @@ static void TextAnnotRect(const Annot *a, RECT *out)
             HGDIOBJ of = NULL;
             if (GdiSelect(dc, f, &of)) {
                 GetTextExtentPoint32W(dc, a->text, lstrlenW(a->text), &s);
-                GdiRelease(dc, f, of, DEFAULT_GUI_FONT, "measure font");
+                GdiReleaseInPaint(dc, f, of, DEFAULT_GUI_FONT, "measure font");
             } else {
                 DeleteObject(f);
             }
@@ -4509,9 +4576,12 @@ static void TestGdiLifecycle(void)
         HGDIOBJ op = NULL;
         BOOL sel = GdiSelect(s.dc, temp, &op);
         DWORD gBefore = GdiCount();
-        BOOL rel = GdiRelease(s.dc, temp, dead2, NULL_PEN, "release fallback");
+        int rfail0 = g_gdiRestoreFailures;
+        GdiReleaseStatus rel = GdiRelease(s.dc, temp, dead2, NULL_PEN, "release fallback");
         DWORD gAfter = GdiCount();
-        TestCheck(sel && !rel, "gdi: release reports restore failure instead of success");
+        /* 恢复失败由 g_gdiRestoreFailures 记录；句柄归属仍应是“已释放” */
+        TestCheck(sel && rel == GdiRelFreed && g_gdiRestoreFailures > rfail0,
+                  "gdi: handle freed even when restore fails");
         TestCheck(gAfter <= gBefore, "gdi: temp object not leaked after failed restore");
 
         LOGPEN lp;
@@ -4537,7 +4607,7 @@ static void TestGdiLifecycle(void)
 
         SIZE sz = {0, 0};
         GetTextExtentPoint32W(s.dc, L"loop", 4, &sz);
-        if (!GdiRelease(s.dc, f, of, DEFAULT_GUI_FONT, "loop font")) ffail++;
+        if (GdiRelease(s.dc, f, of, DEFAULT_GUI_FONT, "loop font") != GdiRelFreed) ffail++;
         if (sz.cx <= 0) ffail++;
     }
     DWORD f1 = GdiCount();
@@ -4555,7 +4625,7 @@ static void TestGdiLifecycle(void)
         if (!GdiSelect(s.dc, p, &op)) { DeleteObject(p); pfail++; continue; }
         MoveToEx(s.dc, 0, 0, NULL);
         LineTo(s.dc, 8, 8);
-        if (!GdiRelease(s.dc, p, op, NULL_PEN, "loop pen")) pfail++;
+        if (GdiRelease(s.dc, p, op, NULL_PEN, "loop pen") != GdiRelFreed) pfail++;
     }
     DWORD p1 = GdiCount();
     printf("gdi pen loop: 1000x, gdi %lu -> %lu, fails=%d\n", p0, p1, pfail);
@@ -4571,7 +4641,7 @@ static void TestGdiLifecycle(void)
         if (!GdiSelect(s.dc, p, &op)) { DeleteObject(p); pfail++; continue; }
         MoveToEx(s.dc, 0, 0, NULL);
         LineTo(s.dc, 8, 8);
-        if (!GdiRelease(s.dc, p, op, NULL_PEN, "loop pen 2")) pfail++;
+        if (GdiRelease(s.dc, p, op, NULL_PEN, "loop pen 2") != GdiRelFreed) pfail++;
     }
     DWORD p2 = GdiCount();
     printf("gdi pen loop: second 1000x, gdi %lu -> %lu\n", p1, p2);
@@ -4645,16 +4715,16 @@ static void TestGdiDeferredRelease(void)
     BOOL selected = GdiSelect(s.dc, pen, &oldPen);
 
     /* stockFallback = -1：没有替代对象；再注入删除失败——
-     * 模拟“对象仍被 DC 引用、DeleteObject 失败”，此时句柄必须保留 */
+     * 模拟“对象仍被 DC 引用、DeleteObject 失败”，此时句柄必须被托管 */
     g_gdiDeleteFailInject = 1;
-    BOOL rel = GdiRelease(s.dc, pen, dead, -1, "defer test");
+    GdiReleaseStatus rel = GdiRelease(s.dc, pen, dead, -1, "defer test");
     g_gdiDeleteFailInject = 0;
 
-    printf("defer: selected=%d released=%d deferredCount=%d (base %d) objType=%lu\n",
-           selected, rel, g_gdiDeferCount, d0,
+    printf("defer: selected=%d status=%d queued=%d (base %d) objType=%lu\n",
+           selected, (int)rel, g_gdiDeferCount, d0,
            (unsigned long)GetObjectType(pen));
 
-    TestCheck(selected && !rel, "defer: release reports failure");
+    TestCheck(selected && rel == GdiRelDeferred, "defer: handle is deferred, not dropped");
     TestCheck(g_gdiDeferCount == d0 + 1, "defer: un-deletable object is retained");
     TestCheck(GetObjectType(pen) != 0, "defer: handle still valid before DC teardown");
 
@@ -4758,31 +4828,47 @@ static void TestGdiDeferredCapacity(void)
     TestCheck(made == NDCS, "defer cap: filled every reserved slot");
     TestCheck(g_gdiDeferCount == base + NDCS, "defer cap: count hits the reserved limit");
 
-    /* 第 65 个：注入让所有驱逐尝试都失败，模拟“64 个都被 DC 锁住”，
-     * 此时必须拒绝并把所有权退回调用方 */
-    HPEN extra = CreatePen(PS_SOLID, 1, RGB(99, 99, 99));
-    if (extra) {
-        g_gdiDeleteFailInject = NDCS;          /* 足够覆盖一次完整驱逐 */
-        BOOL ok = GdiDeferRetain(extra);
+    /* 第 65 个：走真实 GdiRelease()，让“队列满 + 对象仍被 DC 引用”同时成立。
+     * 注入 65 次删除失败，覆盖“一次驱逐扫描（64）+ 本次删除（1）”，
+     * 迫使队列无法接管，必须转由会话保留表持有。 */
+    HDC    extraDc = CreateCompatibleDC(NULL);
+    HPEN   extra   = CreatePen(PS_SOLID, 1, RGB(99, 99, 99));
+    HGDIOBJ eold   = NULL;
+    if (extraDc && extra && GdiSelect(extraDc, extra, &eold)) {
+        int sess0 = g_gdiSessionCount;
+        int rejB  = g_gdiDeferRejected;
+        HPEN dead = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+        if (dead) DeleteObject(dead);
+
+        /* 注入要覆盖三步：GdiRelease 入口 flush（最多 64 次）、本次删除（1 次）、
+         * 队列满后的驱逐扫描（最多 64 次），否则中途会真的删掉对象而腾出空位 */
+        g_gdiDeleteFailInject = NDCS * 2 + 4;
+        GdiReleaseStatus st = GdiRelease(extraDc, extra, dead, -1, "cap overflow");
         g_gdiDeleteFailInject = 0;
-        TestCheck(!ok, "defer cap: overflow is rejected instead of silently dropped");
-        TestCheck(g_gdiDeferRejected == rej0 + 1, "defer cap: rejection is counted");
+
+        printf("defer cap: 65th status=%d queue=%d session=%d\n",
+               (int)st, g_gdiDeferCount, g_gdiSessionCount);
+        TestCheck(st == GdiRelHeldBySession, "defer cap: overflow goes to session table");
+        TestCheck(g_gdiSessionCount == sess0 + 1, "defer cap: 65th handle is reachable in session");
+        TestCheck(g_gdiDeferRejected == rejB + 1, "defer cap: queue-full handoff is counted");
         TestCheck(g_gdiDeferCount == base + NDCS, "defer cap: queue stays within bounds");
-        /* 所有权退回调用方：我们自己负责删掉它 */
-        TestCheck(DeleteObject(extra) ? TRUE : FALSE, "defer cap: caller still owns and frees it");
+    } else {
+        TestCheck(FALSE, "defer cap: setup 65th object");
     }
 
-    /* 销毁所有 DC：这些对象应全部可回收 */
+    /* 销毁所有 DC：队列与会话保留表里的对象应全部可回收 */
     for (int i = 0; i < made; i++) {
         DeleteDC(dcs[i]);
         dcs[i] = NULL;
     }
+    if (extraDc) { DeleteDC(extraDc); extraDc = NULL; }
     GdiFlushDeferred();
 
-    printf("defer cap: after dc destroy queued=%d freed=%d\n",
-           g_gdiDeferCount, g_gdiDeferDone - done0);
-    TestCheck(g_gdiDeferCount == base, "defer cap: all deferred objects released");
-    TestCheck(g_gdiDeferDone - done0 == made, "defer cap: release count matches");
+    printf("defer cap: after dc destroy queued=%d session=%d freed=%d\n",
+           g_gdiDeferCount, g_gdiSessionCount, g_gdiDeferDone - done0);
+    TestCheck(g_gdiDeferCount == base, "defer cap: queue drained");
+    TestCheck(g_gdiSessionCount == 0, "defer cap: session table drained");
+    TestCheck(g_gdiDeferDone - done0 == made, "defer cap: queue release count matches");
     TestCheck(GdiCount() <= g0, "defer cap: no gdi growth");
 
     /* 恢复后仍能正常登记 */
@@ -5036,12 +5122,15 @@ static int RunStabilityTest(void)
     printf("=== gdi total: %lu -> %lu ===\n", g0, g1);
     TestCheck(g1 <= g0, "no gdi leak across whole run");
 
-    printf("=== gdi failures: select=%d restore=%d release=%d | deferred=%d freed=%d evicted=%d rejected=%d lost=%d (slots %d) ===\n",
+    printf("=== gdi failures: select=%d restore=%d release=%d | queue=%d session=%d freed=%d+%d evicted=%d rejected=%d unreleased=%d paintUnreleased=%d (slots %d+%d) ===\n",
            g_gdiSelectFailures, g_gdiRestoreFailures, g_gdiReleaseFailures,
-           g_gdiDeferCount, g_gdiDeferDone, g_gdiDeferEvicted,
-           g_gdiDeferRejected, g_gdiDeferLostHandles, GDI_DEFER_SLOTS);
-    TestCheck(g_gdiDeferCount == 0, "no pending deferred gdi objects at exit");
-    TestCheck(g_gdiDeferLostHandles == 0, "no gdi handle lost during whole run");
+           g_gdiDeferCount, g_gdiSessionCount, g_gdiDeferDone, g_gdiSessionDone,
+           g_gdiDeferEvicted, g_gdiDeferRejected, g_gdiDeferLostHandles,
+           g_gdiUnreleasedInPaint, GDI_DEFER_SLOTS, GDI_SESSION_SLOTS);
+    TestCheck(g_gdiDeferCount == 0 && g_gdiSessionCount == 0,
+              "no pending deferred gdi objects at exit");
+    TestCheck(g_gdiDeferLostHandles == 0 && g_gdiUnreleasedInPaint == 0,
+              "no gdi handle lost or left unowned");
 
     GdiDeferReleaseAll();                  /* 正式退出前的最后一次清理（静态存储无需 free） */
 
