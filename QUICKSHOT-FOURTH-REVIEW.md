@@ -882,6 +882,152 @@ gdi pen loop:  1000x, gdi 37 -> 38 -> 38, fails=0
 
 代码与报告提交：`v1.1.5`（SHA 见交付说明）。
 
+---
+
+## 13. 收尾轮（`v1.1.5` 之后）：动态托管链表 + 绘制批次交接
+
+基线：`18dc9971816541e0ed255d5019461f21ccfdaae1`（`v1.1.5`）。
+
+### 13.1 根因
+
+三级固定数组只是把丢失点从第 65 个推迟到第 77 个：
+
+1. **容量上限与资源生命周期无关**：76 个槽位是人为常量，第 77 个“仍被 DC 引用、删除失败”的对象依然没有任何可达记录；
+2. **`GdiReleaseInPaint()` 只有一个状态返回值**：`GdiRelUnreleased` 时句柄仍留在绘制函数的局部变量里，函数返回即丢失，上层只看到计数和日志；
+3. **绘制函数无法把未托管句柄交给上层**：`DrawAnnotations` 只汇总状态，拿不到具体句柄，无法保存或重试；
+4. **固定数组的“驱逐/扩容”都改变不了问题本质**：只要存在有限容量，就存在第 N+1 个对象。
+
+### 13.2 最终所有权模型
+
+[`shot.c#L296-L348`](file:///C:/code/quickshot/shot.c#L296-L348)（结构与契约）、[`GdiHeldTake` L372](file:///C:/code/quickshot/shot.c#L372-L395)、[`GdiFlushDeferred` L464](file:///C:/code/quickshot/shot.c#L464-L486)
+
+| 组成 | 存储 | 生命周期 | 说明 |
+|---|---|---|---|
+| 托管链表 | `GdiHeldNode` 单链表，节点按需 `malloc` | 进程级 | 唯一持有结构；容量只受进程堆限制，不再有固定槽位 |
+| 绘制批次 | `GdiPaintBatch`（2 槽，调用方栈上） | 单次绘制/单帧 | 容量 = 一次绘制临时对象数上限（箭头=笔+刷，序号=刷+字体），不是托管层级 |
+| 会话兜底批次 | `g_gdiSessionBatch`（2 槽） | 遮罩会话 | 帧末仍交不出的句柄暂存，随 `FreeCapture/OverlayReleaseAll` 重试 |
+
+- **所有权转移**：`GdiRelease()` 删除失败 → `GdiHeldTake()` 建节点入链 → 返回 `GdiRelHeld`；只有节点分配失败（OOM）才返回 `GdiRelUnreleased`，此时句柄仍归调用方。
+- **交接路径**：绘制函数通过 `GdiPaintRelease()/GdiPaintDiscard()` 把 `Unreleased` 句柄写入调用方批次；`DrawAnnotations` 在每个标注结束后 `GdiBatchDrain()` 重试删除/托管；帧末 `GdiBatchAdopt()` 把剩余句柄转入会话兜底批次。
+- **移除条件**：只有 `DeleteObject` 成功或 `GetObjectType()==0` 才摘链并 `free` 节点；删不掉的条目始终留在链表里，退出时逐条报告。
+- **不销毁 DC**：所有重试都只针对“已不再被任何 DC 引用”的对象，绝不为清理句柄而销毁仍在工作的 DC。
+- **重复登记**：`GdiHeldContains()` 去重，同一句柄只保留一个节点。
+
+### 13.3 调用点检查结果
+
+| 调用点 | 接口 | 释放结果处理 |
+|---|---|---|
+| `DrawPenStroke` | `GdiPaintRelease` / `GdiPaintDiscard` | 失败写入批次并返回状态 |
+| `DrawEllipseAnnot` / `DrawRectAnnot` | 同上 | 同上 |
+| `DrawArrowAnnot` | 笔、刷各自独立 `GdiPaintRelease` | 两个句柄分别交接，任一 `Unreleased` 都已在批次中 |
+| `DrawNumberAnnot` | 刷、字体各自独立 `GdiPaintRelease` | 同上 |
+| `DrawTextAnnot` | `GdiPaintRelease` / `GdiPaintDiscard` | 直接返回状态，句柄已进批次或链表 |
+| `TextAnnotRect` | `GdiReleaseInPaint` / `GdiRelease` | 句柄进链表；函数为 `void`，OOM 时无法继续上报（见 13.7） |
+| `DrawAnnotations` | 消费返回值 + `GdiBatchDrain` + `GdiBatchAdopt` | 每标注立即重试，帧末转交会话批次 |
+| `FreeCapture` | `GdiFlushDeferred` | DC 销毁后重试，未释放条目保留 |
+| `OverlayReleaseAll` | 经 `FreeCapture` → `GdiFlushDeferred` | 会话结束兜底 |
+| `WinMain` 退出 | `OverlayReleaseAll` → 删全局字体 → `GdiDeferReleaseAll` | DC 先销毁，再最终重试与报告 |
+| 自检各用例 | 断言枚举、`GdiHeldContains()`、GDI 总量 | 任一不符即 FAIL |
+
+`DrawArrowAnnot` / `DrawNumberAnnot` 的汇总状态不再“代替”任何一个对象：两个对象各自走一次释放流程，任一 `Unreleased` 时对应句柄已分别写入批次，汇总只影响返回值。
+
+### 13.4 容量耗尽与故障注入测试
+
+[`TestGdiDeferredCapacity`](file:///C:/code/quickshot/shot.c#L4896-L5092)，全部走真实调用链：
+
+1. 建 76 个独立 DC + 画笔（对应旧的 64+8+4），逐一选入并交给托管链表；
+2. 创建第 77 个 DC + 画笔，注入 1024 次删除失败，走真实 `GdiRelease()`；
+3. 断言返回 `GdiRelHeld`、`GdiHeldContains(第 77 个句柄)` 为真、链表计数 +1；
+4. 对同一句柄再次 `GdiRelease()`，断言只保留一条记录；
+5. 连续创建 8 个对象并释放失败，逐个断言句柄仍在链表中；
+6. 注入“删除失败 + 节点分配失败”，验证句柄先进入调用方 `GdiPaintBatch`，`GdiBatchDrain()` 后转入链表；
+7. 再次注入两次节点分配失败，验证句柄进入 `g_gdiSessionBatch`，`GdiFlushDeferred()` 后转入链表；
+8. 销毁前 64 个 DC，按注入精确控制，验证只释放这 64 条、其余仍可达；
+9. 全量注入重试失败，验证链表与释放计数都不变；
+10. 销毁剩余 DC，连续两次 `GdiFlushDeferred()`，验证链表清空、计数匹配且重复清理不重复释放；
+11. 清空后再次登记/释放，验证容量恢复。
+
+实测（`--stress-test`）：
+
+```text
+custody cap: filled=76/76 held=76
+custody cap: 77th status=1 held=77
+[PASS] custody cap: 77th handle is reachable after release returned
+[PASS] custody cap: duplicate release keeps exactly one entry
+custody cap: consecutive=8 held=85
+[PASS] custody cap: consecutive failures all keep custody
+[PASS] custody cap: unreleased handle is kept in caller batch
+[PASS] custody cap: batch drain hands handle to custody list
+[PASS] custody cap: session batch keeps handle of last resort
+[PASS] custody cap: session batch hands handle to custody list
+custody cap: total held=87 (expect 87)
+custody cap: partial flush held=23 freed=64
+[PASS] custody cap: partial flush releases only unlocked objects
+[PASS] custody cap: surviving handle still reachable after partial flush
+[PASS] custody cap: failed retry keeps every entry
+custody cap: after dc destroy held=0 freed=87 batch=0
+[PASS] custody cap: custody list fully drained
+[PASS] custody cap: release count matches
+```
+
+`status=1` 即 `GdiRelHeld`；第 77 个句柄在 `GdiRelease()` 返回后仍可通过 `GdiHeldContains()` 查到，不是只验证计数。
+
+`TestGdiDeferredBulk` 同时登记 80 个对象（超过旧 76 槽），验证链表无固定上限：
+
+```text
+defer bulk: made=80 held=80 (base 0)
+[PASS] defer bulk: 80 objects accepted (no fixed cap)
+[PASS] defer bulk: first and last handles are reachable
+defer bulk: after flush held=0 freed=80
+```
+
+### 13.5 遮罩会话生命周期
+
+| 阶段 | 行为 |
+|---|---|
+| `FreeCapture` | 选回原位图 → 删 DC/位图 → `GdiFlushDeferred()`；仍被引用的对象留在链表 |
+| `OverlayReleaseAll` | `TextEditDestroy` → 标注缓存 → `FreeCapture` → `OverlayGdiFree`；会话结束时链表仍保有未释放对象 |
+| `OverlayGdiFree` | 只删全局 UI 笔刷/画笔，不碰托管链表 |
+| `GdiFlushDeferred` | 先 drain 会话批次，再遍历链表；只删可删对象，删不掉的原样保留 |
+| `GdiDeferReleaseAll` | 最后一次 flush 后逐条报告残留（句柄 + 类型），并输出 `freed/held/allocFailures/unreleased` |
+| 重复清理 | 节点只在删除成功/对象失效时摘除，重复调用幂等，不会重复计数 |
+
+### 13.6 回归实测
+
+构建：`gcc -O2 -s -Wall`，退出码 0，无告警。
+
+| 命令 | 退出码 | 结果 |
+|---|---|---|
+| `--stress-test` | 0 | **129 PASS / 0 FAIL** |
+| `--capture-test` | 0 | 2560×1440、`annots: 7`、`png: ok`、热键 ok |
+| `--toolbar-test` | 0 | `cursor mismatches: 0`、`png: ok` |
+| `--demo docs\overlay.png demo4.png` | 0 | SHA256 `A8D9086C38DA2914B751F7F56CD2258C28AA09D78185781573758C201D6F28F2` |
+
+```text
+capture: 1000x, gdi 35 -> 35, fails=0
+text:    1000x, gdi 41 -> 41, fails=0
+gdi font loop: 1000x, gdi 37 -> 37, fails=0
+gdi pen loop:  1000x, gdi 37 -> 38 -> 38, fails=0
+=== gdi total: 35 -> 31 ===
+=== gdi failures: select=4 restore=109 release=6 | held=0 batch=0 freed=171 allocFailures=3 unreleased=2 paintUnreleased=2 ===
+=== OK (0 failures) ===
+```
+
+`allocFailures=3 / unreleased=2 / paintUnreleased=2` 全部来自容量测试的 OOM 注入，且句柄最终都已通过批次或链表找回；正常渲染阶段 GDI 失败计数为 0，GDI 总量下降 4（35→31）。
+
+### 13.7 未解决风险
+
+| # | 风险 | 说明 |
+|---|---|---|
+| 1 | 托管节点分配失败（OOM） | 返回 `GdiRelUnreleased`，绘制路径写入 `GdiPaintBatch`，帧末转入会话批次；若进程持续无法分配 16 字节，句柄最终只能随进程退出，计数会如实记录 |
+| 2 | `TextAnnotRect` 是 `void` 命中测试函数 | 它会把句柄送入链表；只有 OOM 时无法继续向上传递，由 `GdiReleaseInPaint` 计数/日志暴露 |
+| 3 | 进程被强杀 | 链表节点随进程消失，属预期，进程内无法补救 |
+| 4 | 系统对已选入对象的延迟删除 | `DeleteObject` 可能返回成功但实际在 DC 解引用后才回收，只能以 GDI 总量判定 |
+
+### 13.8 本轮提交
+
+代码与报告提交：`v1.1.6`（SHA 见交付说明）。
+
 
 
 
