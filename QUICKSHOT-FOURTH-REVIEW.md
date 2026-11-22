@@ -510,4 +510,117 @@ mosaic: annots 500x cached 3068 us, 500x uncached 20992 us
 | 4 | 延迟队列不在崩溃路径上生效 | 进程被强杀时队列随进程消失，属预期 |
 | 5 | `shot.c` 单文件约 5000 行（含自检） | 按约定不再扩大本轮范围，模块化留到后续 |
 
+---
+
+## 10. 收尾轮（`v1.1.3`）：延迟释放队列静态预留与所有权闭环
+
+基线：`bd01b8e`。只改延迟释放队列、退出清理与对应测试。
+
+### 10.1 原问题的根因
+
+上一版队列用 `realloc` 动态扩容，扩容失败后落到 8 个固定紧急槽；紧急槽满时
+`GdiDeferRetain()` 返回 `FALSE`，而 `GdiRelease()` 只是记一行日志就把句柄丢掉了。
+
+根因不是“槽太少”，而是：
+
+1. **接管能力依赖动态分配**——内存分配失败时没有任何不依赖堆的兜底；
+2. **返回值没有约束力**——返回 `FALSE` 后调用方既不持有也不释放，句柄就此失联；
+3. 固定槽数量与“同时可能删不掉的对象数”之间没有任何论证关系。
+
+### 10.2 新机制
+
+[`shot.c#L296-L407`](file:///C:/code/quickshot/shot.c#L296-L407)
+
+| 项目 | 设计 |
+|---|---|
+| 存储 | `static HGDIOBJ g_gdiDefer[64]`，**全程不使用 malloc/realloc** |
+| 容量依据 | 对象只有“仍被某个 DC 引用”时才删不掉；每个 DC 每类对象最多持有一个，本程序同时存活的 DC（截屏 3 + 马赛克缓存 32 + 临时 DC）远小于 64 |
+| 满时策略 | 先 `GdiDeferEvict()`：对每条重试删除，删掉的成功条目立刻让出槽位 |
+| 驱逐后仍满 | `GdiDeferRejected++` + ERROR 日志 + 返回 `FALSE`，**所有权退回调用方** |
+| 去重 | `GdiDeferContains()`，同一句柄只登记一次 |
+| 移除条件 | 只有删除成功（或对象已不存在）才出队 |
+| 边界 | 写入前检查 `count < GDI_DEFER_SLOTS`，不做任何乘法/翻倍/尺寸计算 |
+| 退出 | 业务窗口与 DC 销毁后 `GdiDeferReleaseAll()`：再 flush 一次、逐条记录残留、清空队列 |
+
+**所有权契约（写在代码注释里）**
+
+1. `GdiDeferRetain()` 返回 `TRUE` → 所有权归队列，调用方不得再释放；
+2. 返回 `FALSE` → **所有权仍归调用方**。`GdiRelease()` 会立刻重试删除：
+   - 成功 → `deleted = TRUE`，如实返回；
+   - 仍失败 → `g_gdiDeferLostHandles++` + ERROR 日志，**绝不假装成功**；
+3. 队列从不销毁任何 DC。
+
+### 10.3 一处重要的真实行为修正
+
+实测发现：**Windows 允许对“已选入 DC 的画笔/画刷/字体”调用 `DeleteObject` 并返回 `TRUE`**
+（对象被标记删除，DC 解引用后才真正释放）。所以“仍被引用 ⇒ 删除失败”这个前提在真实 GDI 上并不成立，
+队列实际上是比原先设想更深一层、更难触发的安全网。
+
+因此容量/所有权两类测试改用统一注入入口 `GdiTryDelete()`（`flush`、`evict`、`GdiRelease` 共用），
+在**不破坏真实 DC** 的前提下构造“删不掉”的状态。这条行为差异也已写进代码注释。
+
+### 10.4 新增/调整的测试
+
+| 测试 | 覆盖点 | 结果 |
+|---|---|---|
+| `TestGdiDeferredRelease` | 单对象：删不掉 → 登记 → DC 销毁后释放 | PASS |
+| `TestGdiDeferredBulk` | 40 条同时待释放，全部回收 | PASS |
+| `TestGdiDeferredDuplicate` | 重复登记只留一条、只释放一次 | PASS |
+| `TestGdiDeferredCapacity` | 真实构造 **64 个**被 64 个 DC 锁住的对象：填满、第 65 个被拒绝且所有权退回、DC 销毁后 64 个全部回收、之后可继续登记 | PASS |
+| `TestGdiDeferredOwnership` | flush 不会强行删除仍被引用的对象；DC 销毁后才释放 | PASS |
+| `TestGdiLifecycle` / `TestTextAnnotSelectFailure` / `TestGdiRestoreFailureDrawing` / `TestRestoreOldBmp` | 原有 GDI 恢复失败相关用例 | PASS |
+
+关键实测输出：
+
+```text
+defer: selected=1 released=0 deferredCount=1 (base 0) objType=1
+defer bulk: made=40 queued=40 (base 0, slots 64)
+defer bulk: after destroy queued=0 freed=40
+defer dup: first=1 second=1 queued=1 (base 0)
+defer cap: made=64 queued=64 rejected=0
+[PASS] defer cap: overflow is rejected instead of silently dropped
+[PASS] defer cap: rejection is counted
+[PASS] defer cap: queue stays within bounds
+[PASS] defer cap: caller still owns and frees it
+defer cap: after dc destroy queued=0 freed=64
+[PASS] defer cap: registration works again after drain
+defer own: selected=1 retained=1 queued=1 type=1
+[PASS] defer own: flush does not force-delete referenced object
+[PASS] defer own: released after dc destroyed
+=== gdi failures: select=4 restore=107 release=2 | deferred=0 freed=108 evicted=0 rejected=1 lost=0 (slots 64) ===
+```
+
+### 10.5 退出流程
+
+`WinMain` 的退出顺序（[shot.c#L5205-L5213](file:///C:/code/quickshot/shot.c#L5205-L5213)）：
+
+1. `HotkeyUnregisterActive()`
+2. `OverlayReleaseAll()`：销毁业务窗口、EDIT 控件、马赛克缓存与全部截屏 DC
+3. 删除 4 个全局字体并将其句柄置空
+4. `GdiDeferReleaseAll()`：最后一次延迟释放 → 逐条记录仍无法释放的对象（句柄 + 类型）→ 清空队列
+5. `GdiplusShutdown()`
+
+顺序保证：**先销毁持有引用的 DC，再做最终释放**，不会提前删掉仍被引用的对象。
+
+### 10.6 回归结果
+
+| 命令 | 退出码 | 结果 |
+|---|---|---|
+| `--stress-test` | 0 | **118 PASS / 0 FAIL** |
+| `--capture-test` | 0 | 2560×1440、`png: ok`、热键可用 |
+| `--toolbar-test` | 0 | `out-of-bounds: 0`、`cursor mismatches: 0` |
+| `--demo` | 0 | SHA256 `A8D9086C…28F2`，与此前各轮逐字节一致 |
+
+GDI 数量：`32 -> 25`；截图 1000 次 `32 → 32`；文字 1000 次 `38 → 38`；字体循环 `34 → 34`；
+画笔两轮 `34 → 35 → 35`；延迟队列结束时 `deferred=0 lost=0`。`-Wall` 无新增告警。
+
+### 10.7 仍然存在的资源丢失路径
+
+| # | 路径 | 说明 |
+|---|---|---|
+| 1 | 64 条同时“删不掉” | 会拒绝登记并把所有权退回调用方；`GdiRelease` 重试删除后仍失败才计入 `lost`。正常操作下不可达（需要 64 个 DC 各锁住一个对象） |
+| 2 | 进程被强杀 | 队列与进程同归于尽，属预期，无法在进程内补救 |
+| 3 | `DeleteObject` 对已选入对象返回 TRUE 的延迟释放 | 由 GDI 在 DC 解引用后完成，本程序无法感知；`GetObjectType` 在回收前仍返回类型，测试已改用 GDI 总量判定 |
+
+
 
