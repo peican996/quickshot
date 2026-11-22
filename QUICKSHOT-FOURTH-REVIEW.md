@@ -740,6 +740,148 @@ pen loop  1000x gdi 37 -> 38 -> 38
 | 2 | 进程被强杀 | 静态托管表随进程消失，属预期 |
 | 3 | GDI 对已选入对象的延迟删除 | 由系统在 DC 解引用后完成，无法在进程内提前感知 |
 
+---
+
+## 12. 收尾轮（`v1.1.4` 之后）：三级持有结构 + 第 73 个对象真实链路测试
+
+基线：`42a6340543519ecac23bdcd91c70743886d1b706`（`v1.1.4`）。
+
+### 12.1 根因
+
+1. **两级同时耗尽即失去持有记录**：上一版只有 `g_gdiDefer[64]` 与 `g_gdiSessionHeld[8]`，两级都满后 `GdiRelease()` 返回 `GdiRelUnreleased`。此时对象仍在某个 DC 里、`DeleteObject` 失败、静态表里没有条目、调用方函数返回后局部变量也消失——没有任何可达的持有记录。
+2. **`GdiReleaseInPaint()` 用 `void` 掩盖失败**：它只把 `GdiRelUnreleased` 变成 `g_gdiUnreleasedInPaint++` 和一条日志，句柄本身仍被丢弃；日志不是所有权。
+3. **早期退出分支绕过统一出口**：`GdiSelect()` 失败的画笔/画刷/字体分支直接 `DeleteObject()`，删除失败时既不计入托管也不上报状态。
+4. **`old == NULL` 被当成恢复失败**：`GdiRelease()` 无条件调用 `GdiRestore()`，而“对象从未选入 DC”并不是恢复失败。
+
+### 12.2 最终所有权模型与容量边界
+
+[`shot.c#L296-L346`](file:///C:/code/quickshot/shot.c#L296-L346)（托管结构）、[`shot.c#L582-L649`](file:///C:/code/quickshot/shot.c#L582-L649)（释放入口）
+
+```c
+typedef enum {
+    GdiRelFreed = 0,        /* 已确认删除（或对象本来就不存在） */
+    GdiRelDeferred,         /* 延迟释放队列持有 */
+    GdiRelHeldBySession,    /* 队列满，会话保留表持有 */
+    GdiRelHeldByOverlay,    /* 前两级都满，遮罩会话（调用方持有点）持有 */
+    GdiRelUnreleased        /* 三级都满：理论不可达，所有权仍在调用方 */
+} GdiReleaseStatus;
+```
+
+| 级别 | 存储 | 容量 | 生命周期 | 何时接管 |
+|---|---|---|---|---|
+| 一级 | `g_gdiDefer[]` | 64 | 进程级 | `DeleteObject` 失败；满时先 `GdiDeferEvict()` 驱逐可释放条目 |
+| 二级 | `g_gdiSessionHeld[]` | 8 | 截屏会话级 | 队列驱逐后仍无空位 |
+| 三级 | `g_gdiOverlayHeld[]` | 4 | 遮罩/截屏会话级 | 前两级都满 |
+| 兜底 | 返回值 `GdiRelUnreleased` | — | 调用方栈帧 | 三级都满（正常路径不可达） |
+
+- **容量边界**：同一时刻最多 76 个“仍被 DC 引用、无法删除”的临时对象可被托管。正常截图流程同时存在的临时对象远小于该值（每个标注最多 2 个，且绘制结束即释放）。
+- **所有权转移时机**：仅在 `GdiTryDelete()` 失败后转移，按 1→2→3 顺序；返回值就是转移结果，调用方必须据此决定是否继续持有。
+- **移除条件**：仅当 `DeleteObject` 成功或 `GetObjectType()==0`（对象已不存在）才从表中移除；不会为了腾空位而销毁任何 DC（[`GdiFlushDeferred`](file:///C:/code/quickshot/shot.c#L437-L483)）。
+- **重复登记**：三级联合去重 `GdiDeferContains()`，同一句柄只保留一条。
+- **`old == NULL` 语义**：表示对象从未成功选入 DC，`GdiRelease()` 跳过恢复，直接删除/托管（[`shot.c#L587-L589`](file:///C:/code/quickshot/shot.c#L587-L589)）。
+
+### 12.3 所有释放调用点的处理情况
+
+| 调用点 | 使用接口 | 是否检查状态 | 失败（`Unreleased`）处理 |
+|---|---|---|---|
+| `DrawPenStroke` | `GdiReleaseInPaint` / 未选入时 `GdiRelease(NULL,…)` | 是，返回给上层 | 逐层上报 |
+| `DrawEllipseAnnot` | `GdiReleaseInPaint` / `GdiRelease(NULL,…)` | 是 | 逐层上报 |
+| `DrawRectAnnot` | `GdiReleaseInPaint` / `GdiRelease(NULL,…)` | 是 | 逐层上报 |
+| `DrawArrowAnnot`（笔 + 画刷） | `GdiReleaseInPaint` ×2 / `GdiRelease(NULL,…)` | 是，两者聚合 | 任一未托管即返回 `Unreleased` |
+| `DrawNumberAnnot`（画刷 + 字体） | `GdiReleaseInPaint` ×2 / `GdiRelease(NULL,…)` | 是，两者聚合 | 同上 |
+| `DrawTextAnnot` | `GdiReleaseInPaint` / `GdiRelease(NULL,…)` | 是，直接返回 | 上报 |
+| `TextAnnotRect`（仅测量） | `GdiReleaseInPaint` / `GdiRelease(NULL,…)` | 否（函数为 `void`，命中测试无持有者） | 由 wrapper 计数并写 ERROR；见 12.7 风险 2 |
+| `DrawAnnotations` | 消费上述返回值 | 是 | 记录标注序号/kind 与计数 |
+| `FreeCapture` | `GdiFlushDeferred()` | — | DC 销毁后重试释放 |
+| `WinMain` 退出 | `OverlayReleaseAll()` → 删全局字体 → `GdiDeferReleaseAll()` | — | DC 先销毁，再做最终清理 |
+| 自检 | 断言枚举值、表内容与 `GdiCount()` | 是 | 任一项不符即 FAIL |
+
+不再存在“释放失败后丢弃局部句柄”的绘制路径：所有临时笔/刷/字体，无论是否成功选入 DC，都经过 `GdiRelease()` / `GdiReleaseInPaint()` 的统一出口。
+
+### 12.4 新增故障注入测试（真实调用链）
+
+[`TestGdiDeferredCapacity`](file:///C:/code/quickshot/shot.c#L4873-L4987)：
+
+1. 64 个独立 DC 各选入一支画笔，填满一级队列 64/64；
+2. 再建 8 个 DC + 画笔，填满二级会话表 8/8；
+3. 创建第 73 个 DC + 画笔（`extra`），并建一个已删除的 `dead` 句柄冒充“原对象”；
+4. 注入 `g_gdiDeleteFailInject = 256`（覆盖入口 flush 64+8、本次删除 1、驱逐扫描 64，共 137，留余量）；
+5. 走真实 [`GdiRelease(extraDc, extra, dead, -1, "cap overflow")`](file:///C:/code/quickshot/shot.c#L4931)；
+6. 断言返回 `GdiRelHeldByOverlay`、三级表 +1、`g_gdiOverlayHeld[ov0] == (HGDIOBJ)extra`——**直接证明第 73 个句柄在函数返回后仍可达**；
+7. 再建第 74 个画笔，走真实 `GdiReleaseInPaint()`，同样断言进入三级表；
+8. 销毁全部 65+8+1 个 DC，`GdiFlushDeferred()` 后断言 queue/session/overlay 全部归零，且各表释放计数与登记数一致；
+9. 清理后再登记一支笔，验证容量恢复、登记与释放仍正常。
+
+重复登记、重复释放、失效对象、删除失败后重试由既有用例覆盖：
+
+| 用例 | 覆盖点 |
+|---|---|
+| `TestGdiDeferredDuplicate` | 同一句柄登记两次只保留一条、只释放一次、只计一次 |
+| `TestGdiDeferredRelease` | 以已失效句柄作为 old 进入释放；注入删除失败 → 托管；DC 销毁后重试成功 |
+| `TestGdiDeferredOwnership` | 仍被 DC 引用的对象在 flush 时不会被错误释放 |
+| `TestGdiDeferredBulk` | 40 条批量托管、容量上限内不越界、DC 销毁后全部回收 |
+| `TestGdiLifecycle` / 字体/画笔 1000 次循环 | 正常路径每次均 `GdiRelFreed`，无增长 |
+| `TestGdiRestoreFailureDrawing` | 恢复失败后 DC 状态不被破坏、对象仍能释放 |
+
+### 12.5 清理与统计口径
+
+[`GdiDeferReleaseAll`](file:///C:/code/quickshot/shot.c#L487-L508)：
+
+1. 先 `GdiFlushDeferred()` 最后重试一次；
+2. 仍在等待的对象**不当作已释放**，也不在报告前从记录里删除，逐条打印句柄与 `GetObjectType` 类型，并分 queue/session/overlay 统计；
+3. 汇总口径：`freed=queue+session+overlay`、`evicted`、`rejected`、`unreleased`；
+4. `g_gdiDeferDone/g_gdiSessionDone/g_gdiOverlayDone` 只在实际删除成功时递增；`g_gdiDeferRejected` 只在队列满、转交下一级时递增；`g_gdiDeferLostHandles` 只在三级全满时递增；`g_gdiUnreleasedInPaint` 只在绘制封装遇到 `Unreleased` 时递增；
+5. 退出顺序：`OverlayReleaseAll()`（销毁业务 DC）→ 删除 4 个全局字体并置 NULL → `GdiDeferReleaseAll()`（[`shot.c#L5416-L5424`](file:///C:/code/quickshot/shot.c#L5416-L5424)）；
+6. 重复调用清理是幂等的：只有删除成功/对象失效才出表，因此重复 flush 不会重复计数或重复释放。
+
+### 12.6 回归实测结果
+
+`gcc -O2 -s -Wall` 构建无告警，退出码 0。
+
+| 命令 | 退出码 | 结果 |
+|---|---|---|
+| `--stress-test` | 0 | **124 PASS / 0 FAIL** |
+| `--capture-test` | 0 | 2560×1440、`annots: 7`、`png: ok`、`hotkey Ctrl+Alt+A: ok` |
+| `--toolbar-test` | 0 | `cursor mismatches: 0`、`png: ok` |
+| `--demo docs\overlay.png demo4.png` | 0 | SHA256 `A8D9086C38DA2914B751F7F56CD2258C28AA09D78185781573758C201D6F28F2` |
+
+关键日志：
+
+```text
+defer cap: made=64 queued=64 rejected=0
+defer cap: session filled=8/8
+defer cap: 73rd status=3 queue=64 session=8 overlay=1
+[PASS] defer cap: 73rd goes to overlay holder
+[PASS] defer cap: overlay holder took custody
+[PASS] defer cap: 73rd handle is still reachable after release returned
+[PASS] defer cap: multi-tier handoff is counted
+[PASS] defer cap: paint wrapper also keeps custody
+defer cap: after dc destroy queued=0 session=0 overlay=0 freed=64/8/2
+[PASS] defer cap: queue drained / session table drained / overlay holder drained
+capture: 1000x, gdi 35 -> 35, fails=0
+text:    1000x, gdi 41 -> 41, fails=0
+gdi font loop: 1000x, gdi 37 -> 37, fails=0
+gdi pen loop:  1000x, gdi 37 -> 38 -> 38, fails=0
+=== gdi total: 35 -> 31 ===
+=== gdi failures: select=4 restore=109 release=4 | queue=0 session=0 overlay=0 freed=108+8+2 evicted=0 rejected=2 unreleased=0 paintUnreleased=0 (slots 64+8+4) ===
+=== OK (0 failures) ===
+```
+
+`select=4 / restore=109 / release=4` 全部来自故障注入用例（正常渲染阶段为 0）；运行结束 `queue/session/overlay` 均为 0，`unreleased=0`、`paintUnreleased=0`，GDI 总量下降 4（35→31），无持续增长。
+
+### 12.7 未解决的 GDI 资源风险
+
+| # | 风险 | 说明 |
+|---|---|---|
+| 1 | 同时出现 >76 个不可删除临时对象 | 三级全满后返回 `GdiRelUnreleased`，所有权退回调用方；需要 76 个 DC 同时各锁住一个对象，正常截图流程不可达 |
+| 2 | `TextAnnotRect` 是 `void` 命中测试辅助函数 | 它会把句柄送入三级托管，但无法把 `Unreleased` 继续向上传递；仅在三全满时由 wrapper 计数/日志暴露 |
+| 3 | 进程被强杀 | 静态托管表随进程消失，属预期，进程内无法补救 |
+| 4 | 系统对已选入对象的延迟删除 | `DeleteObject` 可能返回成功但实际在 DC 解引用后才回收，程序无法提前感知，只能以 GDI 总量判定 |
+
+### 12.8 本轮提交
+
+代码与报告提交：`v1.1.5`（SHA 见交付说明）。
+
 
 
 
