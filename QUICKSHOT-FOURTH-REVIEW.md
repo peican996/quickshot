@@ -1081,6 +1081,59 @@ text measure: oom path status=2 batch=1 held=0
 
 `TextAnnotRect` 的 OOM 路径已闭环，13.7 中第 2 条风险关闭。仍保留：节点分配持续失败（句柄留在会话批次并计数，随进程退出）、进程被强杀、系统对已选入对象的延迟删除。
 
+---
+
+## 15. 第二轮：并行审查结论与根因修复
+
+### 15.1 审查方式
+
+4 个只读审查 agent 并行覆盖：托管核心、标注绘制、遮罩/DC 生命周期、自检质量；随后 3 个通用 agent 按假设逐条核实（H1-H6 / H7-H12 / T1-T7）。确认属实的问题如下。
+
+### 15.2 确认并修复
+
+| # | 级别 | 问题 | 修复 |
+|---|---|---|---|
+| 1 | P0 | `GdiBatchAdd()` 批次满时只计数丢弃句柄；`GdiBatchAdopt()` 会话批次满时同样（OOM 连续发生时可永久泄漏） | **根因修复**：改为“创建时预分配所有权凭据”。`GdiTrackAdd()` 在创建临时对象后立即入册（`held=FALSE`），`GdiHeldTake()` 直接复用该节点转为托管，**释放阶段不再依赖任何分配**；绘制路径因此不会走到批次满 |
+| 2 | P1 | `TextStart()` 在一次循环里最多累积 32 个测量字体的 `Unreleased` 句柄，批次只有 2 槽 | 每轮 `TextAnnotRect()` 后立即 `GdiBatchDrain()`，批次不跨迭代累积 |
+| 3 | P1 | `MosaicCacheFree()`、`BuildFinalBitmap()` 忽略 `DeleteObject`/`DeleteDC` 结果，位图删不掉时静默泄漏 | 新增 `GdiDiscardBitmap()`：删除失败转交托管链表，与其他失败路径一致 |
+| 4 | P1 | `TestGdiDeferredCapacity` 连续失败分支保存了 DC/画笔却没有推进 `ndc`，直接 `break` 导致测试自身漏 DC，污染后续 GDI 基线 | 失败分支同步 `ndc++/capMade++`，由统一 teardown 销毁 |
+| 5 | P1 | 自检模式在 `RunStabilityTest` 后直接返回，跳过 WinMain 的 4 个全局字体释放；终局断言 `g1 <= g0` 因包含 12 个全局对象而掩盖该泄漏 | 抽出 `FreeGlobalFonts()`，生产退出与自检退出共用；增加 `gBase`（预热后、全局对象创建前）基线，终局断言改为 `g1 <= gBase`，消除 12 个对象的松弛 |
+| 6 | P2 | `GdiBatchAdd(NULL, obj)` 直接 return，零告警丢句柄 | 无批次时先重试 `GdiHeldTake()`，失败才计数并记录 |
+| 7 | P2 | 退出断言硬编码 `allocFailures==4 / lost==3 / paintUnreleased==3`，用例被跳过或顺序变化会误导 | 改为不变量断言：`held==0 && batch==0 && tracked==0`、`trackAllocFailures==0`；各注入用例在自身内部断言增量 |
+
+已核实不成立：托管对象被外部删除导致句柄复用误判（无直删路径）；注入开关泄漏（所有 set/reset 成对）；`DrawArrowAnnot` 两个对象互相覆盖（各自独立交接）。
+
+### 15.3 实际结果
+
+```text
+gdi baseline: 27, after warmup: 32
+text measure: tracked status=1 batch=0 held=1
+[PASS] text measure: tracked font is held without release-time allocation
+custody cap: tracked status=1 batch=0 held=88
+[PASS] custody cap: preallocated tracked handle ignores oom
+custody cap: after dc destroy held=0 freed=88 batch=0
+=== gdi total: 27 (base) / 32 (with globals) -> 21 ===
+=== gdi failures: select=4 restore=109 release=6 | held=0 batch=0 tracked=0 freed=173 allocFailures=3/0 unreleased=2 paintUnreleased=2 ===
+=== OK (0 failures) ===
+```
+
+| 命令 | 退出码 | 结果 |
+|---|---|---|
+| `--stress-test` | 0 | **133 PASS / 0 FAIL** |
+| `--capture-test` | 0 | 2560×1440、`png: ok`、热键 ok |
+| `--toolbar-test` | 0 | `cursor mismatches: 0` |
+| `--demo` | 0 | SHA256 `A8D9086C…28F2` 未变 |
+
+GDI 基线从“允许 12 个对象松弛”收紧为严格对比：`27 -> 21`，退出时 `held/batch/tracked` 全为 0。
+
+### 15.4 剩余风险
+
+| # | 风险 | 说明 |
+|---|---|---|
+| 1 | 未在册对象（仅测试/遗留调用）在持续 OOM 下仍可能触发批次满 | 生产绘制路径的临时对象全部在创建时入册，释放不分配；该路径只由注入用例覆盖 |
+| 2 | 进程被强杀 | 链表随进程消失，属预期 |
+| 3 | 系统对已选入对象的延迟删除 | `DeleteObject` 返回成功但实际在 DC 解引用后回收，只能以 GDI 总量判定 |
+
 
 
 

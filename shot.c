@@ -326,13 +326,20 @@ typedef enum {
 
 typedef struct GdiHeldNode {
     HGDIOBJ obj;
+    BOOL held;                 /* TRUE：已转交托管，等待删除；FALSE：仍在用的在册对象 */
     struct GdiHeldNode *next;
 } GdiHeldNode;
 
-static GdiHeldNode *g_gdiHeldHead;     /* 唯一持有结构：动态链表 */
-static int g_gdiHeldCount;             /* 当前链表中等待释放的对象数 */
+/* 同一链表记录两类节点：
+ *   held=FALSE：创建临时对象时预分配的“所有权凭据”，保证释放阶段不再需要分配内存；
+ *   held=TRUE ：已转交托管，等待 DeleteObject 成功。
+ * 只有删除成功/对象失效才摘链并 free。 */
+static GdiHeldNode *g_gdiHeldHead;
+static int g_gdiHeldCount;             /* 等待释放的 held 节点数 */
+static int g_gdiHeldTracked;           /* 在册节点总数（含 held） */
 static int g_gdiHeldDone;              /* 已确认释放并摘链的对象总数 */
-static int g_gdiHeldAllocFailures;     /* 节点分配失败、所有权退回调用方的次数 */
+static int g_gdiHeldAllocFailures;     /* 释放时才分配节点且失败（仅未在册对象） */
+static int g_gdiTrackAllocFailures;    /* 创建时预分配凭据失败 */
 
 /* 单次绘制的句柄交接上下文。容量等于一次绘制可能创建的临时对象数上限
  * （箭头=笔+刷，序号=刷+字体，其余=1），不是托管层级。 */
@@ -360,21 +367,76 @@ static BOOL GdiTryDelete(HGDIOBJ obj)
     return DeleteObject(obj) ? TRUE : FALSE;
 }
 
-static BOOL GdiHeldContains(HGDIOBJ obj)
+static GdiHeldNode *GdiTrackFind(HGDIOBJ obj)
 {
     for (GdiHeldNode *n = g_gdiHeldHead; n; n = n->next)
-        if (n->obj == obj) return TRUE;
-    return FALSE;
+        if (n->obj == obj) return n;
+    return NULL;
 }
 
-/* 接管所有权：节点按需分配，容量只受进程堆限制。
+static BOOL GdiHeldContains(HGDIOBJ obj)
+{
+    GdiHeldNode *n = GdiTrackFind(obj);
+    return n && n->held;
+}
+
+/* 创建临时对象后立刻在册：所有权凭据与对象同时建立。
+ * 之后删除失败进入托管时不再需要分配内存，因此不会出现
+ * “删不掉 + 节点分配失败 + 批次已满”导致的句柄丢失。 */
+static BOOL GdiTrackAdd(HGDIOBJ obj)
+{
+    if (!obj) return TRUE;
+
+    GdiHeldNode *n = (GdiHeldNode *)malloc(sizeof(*n));
+    if (!n) {
+        g_gdiTrackAllocFailures++;
+        QSLog("GdiTrackAdd: ERROR 预分配失败 obj=%p（调用方应立即删除该对象）",
+              (void *)obj);
+        return FALSE;
+    }
+
+    n->obj  = obj;
+    n->held = FALSE;
+    n->next = g_gdiHeldHead;
+    g_gdiHeldHead = n;
+    g_gdiHeldTracked++;
+    return TRUE;
+}
+
+/* 对象已确认删除/失效：摘链并释放凭据（held 或未 held 都适用）。 */
+static void GdiTrackForget(HGDIOBJ obj)
+{
+    if (!obj) return;
+
+    GdiHeldNode **pp = &g_gdiHeldHead;
+    while (*pp) {
+        GdiHeldNode *n = *pp;
+        if (n->obj == obj) {
+            *pp = n->next;
+            if (n->held) g_gdiHeldCount--;
+            g_gdiHeldTracked--;
+            n->obj = NULL;
+            free(n);
+            return;
+        }
+        pp = &n->next;
+    }
+}
+
+/* 接管所有权：优先复用创建时预分配的节点；未在册对象才按需分配。
  * 分配失败时返回 FALSE，句柄仍归调用方（绝不假装成功）。 */
 static BOOL GdiHeldTake(HGDIOBJ obj)
 {
     if (!obj) return TRUE;
 
-    if (GdiHeldContains(obj)) {         /* 去重：同一句柄只登记一次 */
-        QSLog("GdiHeldTake: obj=%p 已在托管链表，忽略重复登记", (void *)obj);
+    GdiHeldNode *n = GdiTrackFind(obj);
+    if (n) {
+        if (n->held) {                  /* 去重：同一句柄只登记一次 */
+            QSLog("GdiHeldTake: obj=%p 已在托管链表，忽略重复登记", (void *)obj);
+            return TRUE;
+        }
+        n->held = TRUE;                 /* 在册节点直接转为托管，不需要分配 */
+        g_gdiHeldCount++;
         return TRUE;
     }
 
@@ -385,7 +447,7 @@ static BOOL GdiHeldTake(HGDIOBJ obj)
         return FALSE;
     }
 
-    GdiHeldNode *n = (GdiHeldNode *)malloc(sizeof(*n));
+    n = (GdiHeldNode *)malloc(sizeof(*n));
     if (!n) {
         g_gdiHeldAllocFailures++;
         QSLog("GdiHeldTake: ERROR 节点分配失败 obj=%p（所有权仍归调用方）", (void *)obj);
@@ -393,10 +455,24 @@ static BOOL GdiHeldTake(HGDIOBJ obj)
     }
 
     n->obj  = obj;
+    n->held = TRUE;
     n->next = g_gdiHeldHead;
     g_gdiHeldHead = n;
     g_gdiHeldCount++;
+    g_gdiHeldTracked++;
     return TRUE;
+}
+
+/* 位图类对象的统一丢弃：删除失败时同样交给托管链表，避免静默泄漏。
+ * 调用前应确保位图已从 DC 选回（DC 已销毁或 GdiRestore 成功）。 */
+static void GdiDiscardBitmap(HBITMAP hbm)
+{
+    if (!hbm) return;
+    if (!DeleteObject(hbm)) {
+        QSLog("GdiDiscardBitmap: DeleteObject 失败 hbm=%p，转交托管", (void *)hbm);
+        if (!GdiHeldTake((HGDIOBJ)hbm))
+            QSLog("GdiDiscardBitmap: ERROR hbm=%p 托管失败", (void *)hbm);
+    }
 }
 
 static void GdiBatchInit(GdiPaintBatch *b)
@@ -410,7 +486,15 @@ static void GdiBatchInit(GdiPaintBatch *b)
  * 正常流程（含 76+ 对象被 DC 锁住）都不会走到这里，只有 OOM 才会。 */
 static void GdiBatchAdd(GdiPaintBatch *b, HGDIOBJ obj)
 {
-    if (!b || !obj) return;
+    if (!obj) return;
+
+    if (!b) {                           /* 没有批次：至少再试一次托管，不能静默丢句柄 */
+        if (!GdiHeldTake(obj)) {
+            g_gdiDeferLostHandles++;
+            QSLog("GdiBatchAdd: ERROR 无批次且托管失败，obj=%p 无可靠持有者", (void *)obj);
+        }
+        return;
+    }
 
     if (b->count >= GDI_BATCH_SLOTS) {
         g_gdiDeferLostHandles++;
@@ -468,6 +552,12 @@ static void GdiFlushDeferred(void)
     GdiHeldNode **pp = &g_gdiHeldHead;
     while (*pp) {
         GdiHeldNode *n = *pp;
+
+        if (!n->held) {                 /* 在册但未托管：对象仍在使用，不能碰 */
+            pp = &n->next;
+            continue;
+        }
+
         BOOL gone = (!n->obj || GetObjectType(n->obj) == 0);
 
         if (!gone && GdiTryDelete(n->obj)) {
@@ -481,6 +571,7 @@ static void GdiFlushDeferred(void)
             n->obj = NULL;
             free(n);
             g_gdiHeldCount--;
+            g_gdiHeldTracked--;
         } else {
             pp = &n->next;
         }
@@ -496,8 +587,13 @@ static void GdiDeferReleaseAll(void)
     if (g_gdiHeldCount > 0) {
         QSLog("GdiDeferReleaseAll: 退出时仍有 %d 个对象等待释放", g_gdiHeldCount);
         for (GdiHeldNode *n = g_gdiHeldHead; n; n = n->next)
-            QSLog("  仍在等待: obj=%p type=%lu",
-                  (void *)n->obj, (unsigned long)GetObjectType(n->obj));
+            if (n->held)
+                QSLog("  仍在等待: obj=%p type=%lu",
+                      (void *)n->obj, (unsigned long)GetObjectType(n->obj));
+    }
+    if (g_gdiHeldTracked > g_gdiHeldCount) {
+        QSLog("GdiDeferReleaseAll: 警告 仍有 %d 个在册对象未释放",
+              g_gdiHeldTracked - g_gdiHeldCount);
     }
     if (g_gdiSessionBatch.count > 0) {
         QSLog("GdiDeferReleaseAll: 退出时遮罩会话批次仍有 %d 个句柄", g_gdiSessionBatch.count);
@@ -506,8 +602,9 @@ static void GdiDeferReleaseAll(void)
                   (void *)g_gdiSessionBatch.obj[i],
                   (unsigned long)GetObjectType(g_gdiSessionBatch.obj[i]));
     }
-    QSLog("GdiDeferReleaseAll: freed=%d, held=%d, allocFailures=%d, unreleased=%d",
-          g_gdiHeldDone, g_gdiHeldCount, g_gdiHeldAllocFailures, g_gdiDeferLostHandles);
+    QSLog("GdiDeferReleaseAll: freed=%d, held=%d, tracked=%d, allocFailures=%d/%d, unreleased=%d",
+          g_gdiHeldDone, g_gdiHeldCount, g_gdiHeldTracked,
+          g_gdiHeldAllocFailures, g_gdiTrackAllocFailures, g_gdiDeferLostHandles);
 }
 
 static BOOL GdiSelect(HDC hdc, HGDIOBJ obj, HGDIOBJ *old)
@@ -605,6 +702,7 @@ static GdiReleaseStatus GdiRelease(HDC hdc, HGDIOBJ obj, HGDIOBJ old,
 
     if (obj) {
         if (GdiTryDelete(obj)) {
+            GdiTrackForget(obj);            /* 对象已删除，释放创建时的在册凭据 */
             st = GdiRelFreed;
         } else {
             QSLog("GdiRelease(%s): 删除失败 obj=%p（仍被 DC 引用）", ctx, (void *)obj);
@@ -927,6 +1025,7 @@ static GdiReleaseStatus DrawPenStroke(HDC hdc, const Annot *a, GdiPaintBatch *ba
 {
     if (a->npts < 2) return GdiRelFreed;
     HPEN pen = CreatePen(PS_SOLID, a->width, a->color);
+    if (!GdiTrackAdd(pen)) { if (pen) DeleteObject(pen); return GdiRelFreed; }
     HGDIOBJ old = NULL;
     if (!GdiSelect(hdc, pen, &old))
         return GdiPaintDiscard(pen, "pen stroke unselected", batch);
@@ -937,6 +1036,7 @@ static GdiReleaseStatus DrawPenStroke(HDC hdc, const Annot *a, GdiPaintBatch *ba
 static GdiReleaseStatus DrawEllipseAnnot(HDC hdc, const Annot *a, GdiPaintBatch *batch)
 {
     HPEN pen = CreatePen(PS_SOLID, a->width, a->color);
+    if (!GdiTrackAdd(pen)) { if (pen) DeleteObject(pen); return GdiRelFreed; }
     HGDIOBJ oldPen = NULL, oldBr = NULL;
     if (!GdiSelect(hdc, pen, &oldPen))
         return GdiPaintDiscard(pen, "ellipse pen unselected", batch);
@@ -951,6 +1051,7 @@ static GdiReleaseStatus DrawEllipseAnnot(HDC hdc, const Annot *a, GdiPaintBatch 
 static GdiReleaseStatus DrawRectAnnot(HDC hdc, const Annot *a, GdiPaintBatch *batch)
 {
     HPEN pen = CreatePen(PS_SOLID, a->width, a->color);
+    if (!GdiTrackAdd(pen)) { if (pen) DeleteObject(pen); return GdiRelFreed; }
     HGDIOBJ oldPen = NULL, oldBr = NULL;
     if (!GdiSelect(hdc, pen, &oldPen))
         return GdiPaintDiscard(pen, "rect pen unselected", batch);
@@ -981,6 +1082,7 @@ static GdiReleaseStatus DrawArrowAnnot(HDC hdc, const Annot *a, GdiPaintBatch *b
     head[2].y = y2 - (int)(hl * sin(ang + 0.42));
 
     HPEN pen = CreatePen(PS_SOLID, a->width, a->color);
+    if (!GdiTrackAdd(pen)) { if (pen) DeleteObject(pen); return GdiRelFreed; }
     HGDIOBJ oldPen = NULL;
     if (!GdiSelect(hdc, pen, &oldPen))
         return GdiPaintDiscard(pen, "arrow pen unselected", batch);
@@ -990,6 +1092,7 @@ static GdiReleaseStatus DrawArrowAnnot(HDC hdc, const Annot *a, GdiPaintBatch *b
     LineTo(hdc, (int)(x2 - hl * 0.55 * cos(ang)), (int)(y2 - hl * 0.55 * sin(ang)));
 
     HBRUSH br = CreateSolidBrush(a->color);
+    if (br && !GdiTrackAdd(br)) { DeleteObject(br); br = NULL; }
     HGDIOBJ oldBr = NULL, oldNullPen = NULL;
     GdiReleaseStatus stBr = GdiRelFreed;
     if (GdiSelect(hdc, br, &oldBr)) {
@@ -1060,7 +1163,7 @@ static void MosaicCacheFree(MosaicCache *c)
         GdiFlushDeferred();                 /* 缓存的 DC 已销毁，挂起对象可释放 */
     }
     c->oldBmp = NULL;
-    if (c->hbm) { DeleteObject(c->hbm); c->hbm = NULL; }
+    if (c->hbm) { GdiDiscardBitmap(c->hbm); c->hbm = NULL; }
     c->bits = NULL;
     c->capW = c->capH = 0;
     c->epoch = 0;
@@ -1193,6 +1296,7 @@ static GdiReleaseStatus DrawNumberAnnot(HDC hdc, const Annot *a, GdiPaintBatch *
     RECT r = { l, t, l + d, t + d };
 
     HBRUSH br = CreateSolidBrush(a->color);
+    if (br && !GdiTrackAdd(br)) { DeleteObject(br); br = NULL; }
     HGDIOBJ oldBr = NULL, oldPen = NULL;
     GdiReleaseStatus stBr = GdiRelFreed;
     if (GdiSelect(hdc, br, &oldBr)) {
@@ -1209,6 +1313,7 @@ static GdiReleaseStatus DrawNumberAnnot(HDC hdc, const Annot *a, GdiPaintBatch *
                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                           CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
                           L"Microsoft YaHei UI");
+    if (f && !GdiTrackAdd(f)) { DeleteObject(f); f = NULL; }
     if (!f) return stBr;                    /* 没字体就只保留圆底 */
     HGDIOBJ oldF = NULL;
     GdiReleaseStatus stF = GdiRelFreed;
@@ -1234,6 +1339,7 @@ static GdiReleaseStatus DrawTextAnnot(HDC hdc, const Annot *a, GdiPaintBatch *ba
                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                           CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
                           L"Microsoft YaHei UI");
+    if (f && !GdiTrackAdd(f)) { DeleteObject(f); f = NULL; }
     if (!f) return GdiRelFreed;
     HGDIOBJ oldF = NULL;
     if (GdiSelect(hdc, f, &oldF)) {
@@ -1327,7 +1433,7 @@ static HBITMAP BuildFinalBitmap(int x, int y, int w, int h, void **ppBits)
     DeleteDC(dc);
     GdiFlushDeferred();                    /* 临时 DC 已销毁，挂起对象可释放 */
     if (!ok) {                             /* 底图都没贴成功，返回的位图没有意义 */
-        DeleteObject(hbm);
+        GdiDiscardBitmap(hbm);
         return NULL;
     }
 
@@ -2314,6 +2420,7 @@ static GdiReleaseStatus TextAnnotRect(const Annot *a, RECT *out, GdiPaintBatch *
                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                               CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
                               L"Microsoft YaHei UI");
+        if (f && !GdiTrackAdd(f)) { DeleteObject(f); f = NULL; }
         if (f) {
             HGDIOBJ of = NULL;
             if (GdiSelect(dc, f, &of)) {
@@ -2345,6 +2452,7 @@ static void TextStart(int x, int y)
         if (g_ann[i].kind != AN_TEXT) continue;
         RECT r;
         TextAnnotRect(&g_ann[i], &r, &batch);
+        GdiBatchDrain(&batch);              /* 每个标注后立刻重试，批次不跨迭代累积 */
         r.left -= 4; r.top -= 4; r.right += 4; r.bottom += 4;   /* 放宽一点好点中 */
         if (PtIn(r, x, y)) { hitIdx = i; break; }
     }
@@ -3788,15 +3896,15 @@ static HBITMAP RenderOverlayToDib(void **ppBits)
 
     void *bits = NULL;
     HBITMAP hbm = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
-    if (!hbm || !bits) { if (hbm) DeleteObject(hbm); return NULL; }
+    if (!hbm || !bits) { GdiDiscardBitmap(hbm); return NULL; }
 
     HDC dc = CreateCompatibleDC(NULL);
-    if (!dc) { DeleteObject(hbm); return NULL; }
+    if (!dc) { GdiDiscardBitmap(hbm); return NULL; }
 
     HGDIOBJ old = NULL;
     if (!GdiSelect(dc, hbm, &old)) {
         DeleteDC(dc);
-        DeleteObject(hbm);
+        GdiDiscardBitmap(hbm);
         return NULL;
     }
     OverlayDraw(dc);
@@ -4781,25 +4889,21 @@ static void TestTextAnnotSelectFailure(void)
               "text measure: failed select leaves nothing to the caller");
     TestCheck(g1 <= g0, "text measure: font not leaked on select failure");
 
-    /* 非 void 接口的关键路径：字体删不掉 + 节点分配失败时，
-     * 句柄必须落在调用方批次里，drain 后再进托管链表 */
+    /* 在册字体：所有权凭据在创建时已预分配，即使注入节点分配失败，
+     * 删除失败的字体也必须直接进入托管，而不是退化成批次/计数 */
     int heldBase = g_gdiHeldCount;
     GdiPaintBatch ob;
     GdiBatchInit(&ob);
     g_gdiDeleteFailInject = 1024;
-    g_gdiHeldFailInject   = 1;
+    g_gdiHeldFailInject   = 1;             /* 对在册对象不应生效 */
     GdiReleaseStatus ost = TextAnnotRect(&a, &r, &ob);
     g_gdiDeleteFailInject = 0;
     g_gdiHeldFailInject   = 0;
-    printf("text measure: oom path status=%d batch=%d held=%d\n",
+    printf("text measure: tracked status=%d batch=%d held=%d\n",
            (int)ost, ob.count, g_gdiHeldCount);
-    TestCheck(ost == GdiRelUnreleased && ob.count == 1 && ob.obj[0] != NULL,
-              "text measure: unreleased font is kept in caller batch");
+    TestCheck(ost == GdiRelHeld && ob.count == 0 && g_gdiHeldCount == heldBase + 1,
+              "text measure: tracked font is held without release-time allocation");
 
-    g_gdiDeleteFailInject = 1024;          /* 仍然删不掉，但允许托管 */
-    TestCheck(GdiBatchDrain(&ob) == 0 && g_gdiHeldCount == heldBase + 1,
-              "text measure: batch drain hands font to custody");
-    g_gdiDeleteFailInject = 0;
     GdiFlushDeferred();                    /* 屏幕 DC 已 Release，字体可真正删除 */
     TestCheck(g_gdiHeldCount == heldBase, "text measure: custody releases after dc release");
 
@@ -5008,7 +5112,7 @@ static void TestGdiDeferredCapacity(void)
         GdiReleaseStatus st = GdiRelease(dc, p, old, NULL_PEN, "cap extra");
         g_gdiDeleteFailInject = 0;
         if (st != GdiRelHeld || !GdiHeldContains((HGDIOBJ)p) || g_gdiHeldCount != h0 + 1) {
-            dcs[ndc] = dc; pens[ndc] = p;
+            dcs[ndc] = dc; pens[ndc] = p; ndc++; capMade++;
             TestCheck(FALSE, "custody cap: consecutive object keeps custody");
             break;
         }
@@ -5079,6 +5183,34 @@ static void TestGdiDeferredCapacity(void)
         }
     }
 
+    /* 5b) 在册对象：节点在创建时已预分配，即使注入节点分配失败也必须能托管 */
+    {
+        HDC dc = CreateCompatibleDC(NULL);
+        HPEN p = CreatePen(PS_SOLID, 1, RGB(70, 70, 70));
+        HGDIOBJ old = NULL;
+        BOOL tracked = (p != NULL) && GdiTrackAdd(p);
+        if (!tracked && p) { DeleteObject(p); p = NULL; }
+
+        if (dc && p && GdiSelect(dc, p, &old)) {
+            GdiPaintBatch b;
+            GdiBatchInit(&b);
+            g_gdiDeleteFailInject = 1024;
+            g_gdiHeldFailInject   = 1;
+            GdiReleaseStatus st = GdiPaintRelease(dc, p, old, NULL_PEN, "cap tracked", &b);
+            g_gdiHeldFailInject   = 0;
+            g_gdiDeleteFailInject = 0;
+            printf("custody cap: tracked status=%d batch=%d held=%d\n",
+                   (int)st, b.count, g_gdiHeldCount);
+            TestCheck(st == GdiRelHeld && b.count == 0 && GdiHeldContains((HGDIOBJ)p),
+                      "custody cap: preallocated tracked handle ignores oom");
+            dcs[ndc] = dc; pens[ndc] = p; ndc++; capMade++;
+        } else {
+            if (p) { DeleteObject(p); GdiTrackForget(p); }
+            if (dc) DeleteDC(dc);
+            TestCheck(FALSE, "custody cap: setup tracked object");
+        }
+    }
+
     printf("custody cap: total held=%d (expect %d)\n", g_gdiHeldCount, base + capMade);
     TestCheck(g_gdiHeldCount == base + capMade, "custody cap: every released object is held");
     /* 3 次节点分配失败：步骤 4 一次；步骤 5 的 GdiRelease 与批次兜底各一次。
@@ -5086,8 +5218,8 @@ static void TestGdiDeferredCapacity(void)
     TestCheck(g_gdiDeferLostHandles == lost0 + 2 && g_gdiHeldAllocFailures == alloc0 + 3,
               "custody cap: OOM fallbacks are counted, not silently dropped");
 
-    /* 6) 部分成功：先销毁前 64 个 DC。链表是后进先出，先失败的 23 条
-     *    （后建的 11 条 + 仍存活的 12 条）用注入挡住，其余 64 条应真正释放 */
+    /* 6) 部分成功：先销毁前 64 个 DC。链表是后进先出，先挡住仍在用的条目，
+     *    其余 64 条（DC 已销毁）应真正释放 */
     int releaseFirst = 64;
     for (int i = 0; i < releaseFirst && i < ndc; i++) {
         DeleteDC(dcs[i]);
@@ -5103,10 +5235,10 @@ static void TestGdiDeferredCapacity(void)
               "custody cap: partial flush releases only unlocked objects");
     TestCheck(g_gdiHeldCount == base + capMade - releaseFirst,
               "custody cap: partial flush keeps the rest reachable");
-    TestCheck(!GdiHeldContains((HGDIOBJ)pens[releaseFirst - 1]) &&
-              GdiHeldContains((HGDIOBJ)pens[releaseFirst]),
-              "custody cap: surviving handle still reachable after partial flush");
-
+    if (ndc > releaseFirst)
+        TestCheck(!GdiHeldContains((HGDIOBJ)pens[releaseFirst - 1]) &&
+                  GdiHeldContains((HGDIOBJ)pens[releaseFirst]),
+                  "custody cap: surviving handle still reachable after partial flush");
     /* 7) 释放重试失败：仍被 DC 引用的对象不能因重试而被误删 */
     int beforeRetry = g_gdiHeldCount;
     int doneBeforeRetry = g_gdiHeldDone;
@@ -5323,6 +5455,15 @@ static void WarmUpAll(HWND overlay)
     g_ov.hwnd = NULL;
 }
 
+static void FreeGlobalFonts(void)
+{
+    if (g_fontLabel) DeleteObject(g_fontLabel);
+    if (g_fontToast) DeleteObject(g_fontToast);
+    if (g_fontText)  DeleteObject(g_fontText);
+    if (g_fontIcon)  DeleteObject(g_fontIcon);
+    g_fontLabel = g_fontToast = g_fontText = g_fontIcon = NULL;
+}
+
 static int RunStabilityTest(void)
 {
     printf("=== QuickShot stability self-test ===\n");
@@ -5339,9 +5480,12 @@ static int RunStabilityTest(void)
      * 第二遍之后基线才稳定，避免把一次性缓存误判成泄漏 */
     WarmUpAll(overlay);
     WarmUpAll(overlay);
-    TestOverlayEnsureGdi();                /* 预热结尾释放过全局对象，正式测试前重建 */
+    /* 预热结尾已释放全局 UI 对象；此时基线不含 7 个画刷 + 5 个画笔，
+     * 退出时它们也会被 OverlayGdiFree 释放，因此可以做到无松弛对比 */
+    DWORD gBase = GdiCount();
+    TestOverlayEnsureGdi();                /* 正式测试前重建全局对象 */
     DWORD g0 = GdiCount();
-    printf("  gdi after warmup: %lu\n", g0);
+    printf("  gdi baseline: %lu, after warmup: %lu\n", gBase, g0);
     /* 正常渲染路径不允许出现任何 GDI 失败（注入测试在更后面才执行） */
     TestCheck(g_gdiSelectFailures == 0 && g_gdiRestoreFailures == 0 &&
               g_gdiReleaseFailures == 0,
@@ -5378,22 +5522,22 @@ static int RunStabilityTest(void)
     DestroyWindow(g_hMsgWnd);
     g_hMsgWnd = NULL;
     OverlayReleaseAll();
+    FreeGlobalFonts();                     /* 与生产退出路径保持一致，避免自检漏掉全局字体 */
 
     DWORD g1 = GdiCount();
-    printf("=== gdi total: %lu -> %lu ===\n", g0, g1);
-    TestCheck(g1 <= g0, "no gdi leak across whole run");
+    printf("=== gdi total: %lu (base) / %lu (with globals) -> %lu ===\n", gBase, g0, g1);
+    TestCheck(g1 <= gBase, "no gdi leak across whole run");
 
-    printf("=== gdi failures: select=%d restore=%d release=%d | held=%d batch=%d freed=%d allocFailures=%d unreleased=%d paintUnreleased=%d ===\n",
+    printf("=== gdi failures: select=%d restore=%d release=%d | held=%d batch=%d tracked=%d freed=%d allocFailures=%d/%d unreleased=%d paintUnreleased=%d ===\n",
            g_gdiSelectFailures, g_gdiRestoreFailures, g_gdiReleaseFailures,
-           g_gdiHeldCount, g_gdiSessionBatch.count, g_gdiHeldDone,
-           g_gdiHeldAllocFailures, g_gdiDeferLostHandles, g_gdiUnreleasedInPaint);
-    TestCheck(g_gdiHeldCount == 0 && g_gdiSessionBatch.count == 0,
+           g_gdiHeldCount, g_gdiSessionBatch.count, g_gdiHeldTracked, g_gdiHeldDone,
+           g_gdiHeldAllocFailures, g_gdiTrackAllocFailures,
+           g_gdiDeferLostHandles, g_gdiUnreleasedInPaint);
+    TestCheck(g_gdiHeldCount == 0 && g_gdiSessionBatch.count == 0 &&
+              g_gdiHeldTracked == 0,
               "no pending gdi objects at exit");
-    /* 4 次 allocFailures / 3 次 unreleased 分别来自 TextAnnotRect 与容量测试的 OOM 注入，
-     * 句柄最终都已通过批次或链表找回 */
-    TestCheck(g_gdiHeldAllocFailures == 4 && g_gdiDeferLostHandles == 3 &&
-              g_gdiUnreleasedInPaint == 3,
-              "injected oom fallbacks are counted and recovered");
+    TestCheck(g_gdiTrackAllocFailures == 0,
+              "no ownership record allocation failure in normal paths");
 
     GdiDeferReleaseAll();                  /* 正式退出前的最后一次清理（静态存储无需 free） */
 
@@ -5572,11 +5716,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
 
     HotkeyUnregisterActive();
     OverlayReleaseAll();                   /* 业务窗口与所有 DC 先销毁 */
-    if (g_fontLabel) DeleteObject(g_fontLabel);
-    if (g_fontToast) DeleteObject(g_fontToast);
-    if (g_fontText)  DeleteObject(g_fontText);
-    if (g_fontIcon)  DeleteObject(g_fontIcon);
-    g_fontLabel = g_fontToast = g_fontText = g_fontIcon = NULL;
+    FreeGlobalFonts();
     /* DC 与全局 GDI 对象都销毁后再做最后一次延迟释放，并报告无法释放的残留 */
     GdiDeferReleaseAll();
     g_gdiplusOk = FALSE;
