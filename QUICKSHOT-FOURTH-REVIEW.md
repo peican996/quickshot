@@ -1028,6 +1028,59 @@ gdi pen loop:  1000x, gdi 37 -> 38 -> 38, fails=0
 
 代码与报告提交：`v1.1.6`（SHA 见交付说明）。
 
+---
+
+## 14. 收尾（`v1.1.6` 之后）：`TextAnnotRect` 非 void 化
+
+### 14.1 原问题
+
+`TextAnnotRect()` 是 `void` 命中测试函数，内部 `GdiReleaseInPaint()` 返回 `GdiRelUnreleased`（OOM 导致节点分配失败）时，句柄只写进计数和日志，函数返回后没有任何持有者——与 `DrawAnnotations` 修复前的问题相同。
+
+### 14.2 修改
+
+[`TextAnnotRect` L2307](file:///C:/code/quickshot/shot.c#L2307-L2334)：
+
+```c
+static GdiReleaseStatus TextAnnotRect(const Annot *a, RECT *out, GdiPaintBatch *batch);
+```
+
+- 正常路径改走 `GdiPaintRelease(..., batch)`，未选入 DC 时走 `GdiPaintDiscard(..., batch)`；
+- 返回测量字体的最终归属，`Unreleased` 时句柄已写入调用方批次。
+
+调用点：
+
+| 调用点 | 处理 |
+|---|---|
+| [`TextStart` L2336](file:///C:/code/quickshot/shot.c#L2336-L2360) | 局部 `GdiPaintBatch`，循环结束后 `GdiBatchDrain()` 重试，`GdiBatchAdopt()` 把剩余句柄转入遮罩会话兜底批次 |
+| [`TestTextAnnotSelectFailure` L4757](file:///C:/code/quickshot/shot.c#L4757-L4810) | 断言选入失败返回 `GdiRelFreed` 且批次为空；新增 OOM 路径：返回 `GdiRelUnreleased`、批次持有句柄、drain 后进入托管链表、DC 释放后可真正删除 |
+
+### 14.3 实测
+
+```text
+text measure: injected select failure, status=0 rect 0x0, gdi 32 -> 32
+[PASS] text measure: failed select leaves nothing to the caller
+[PASS] text measure: font not leaked on select failure
+text measure: oom path status=2 batch=1 held=0
+[PASS] text measure: unreleased font is kept in caller batch
+[PASS] text measure: batch drain hands font to custody
+[PASS] text measure: custody releases after dc release
+=== gdi failures: select=4 restore=109 release=7 | held=0 batch=0 freed=172 allocFailures=4 unreleased=3 paintUnreleased=3 ===
+=== OK (0 failures) ===
+```
+
+| 命令 | 退出码 | 结果 |
+|---|---|---|
+| `--stress-test` | 0 | **133 PASS / 0 FAIL** |
+| `--capture-test` | 0 | 2560×1440、`png: ok`、热键 ok |
+| `--toolbar-test` | 0 | `cursor mismatches: 0` |
+| `--demo` | 0 | SHA256 `A8D9086C…28F2` 未变 |
+
+`allocFailures=4 / unreleased=3 / paintUnreleased=3` 全部来自注入用例，且句柄最终都被批次或链表找回；正常路径仍为 0，GDI 总量 `32 -> 25`（自检内部基线）。
+
+### 14.4 剩余风险
+
+`TextAnnotRect` 的 OOM 路径已闭环，13.7 中第 2 条风险关闭。仍保留：节点分配持续失败（句柄留在会话批次并计数，随进程退出）、进程被强杀、系统对已选入对象的延迟删除。
+
 
 
 

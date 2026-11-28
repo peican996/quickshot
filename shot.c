@@ -2301,10 +2301,13 @@ static void TextCancel(void)
     OverlayRedraw();
 }
 
-/* 量出一条文字标注占多大地方，用于判断有没有点到它 */
-static void TextAnnotRect(const Annot *a, RECT *out)
+/* 量出一条文字标注占多大地方，用于判断有没有点到它。
+ * 返回测量用字体的最终归属；无法托管（OOM）时句柄写入调用方 batch，
+ * 由调用方在返回后立即 drain，不能随局部变量消失。 */
+static GdiReleaseStatus TextAnnotRect(const Annot *a, RECT *out, GdiPaintBatch *batch)
 {
     SIZE s = {0, 0};
+    GdiReleaseStatus st = GdiRelFreed;
     HDC dc = GetDC(NULL);
     if (dc) {
         HFONT f = CreateFontW(-a->fontH, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0,
@@ -2315,9 +2318,9 @@ static void TextAnnotRect(const Annot *a, RECT *out)
             HGDIOBJ of = NULL;
             if (GdiSelect(dc, f, &of)) {
                 GetTextExtentPoint32W(dc, a->text, lstrlenW(a->text), &s);
-                GdiReleaseInPaint(dc, f, of, DEFAULT_GUI_FONT, "measure font");
+                st = GdiPaintRelease(dc, f, of, DEFAULT_GUI_FONT, "measure font", batch);
             } else {
-                GdiRelease(NULL, f, NULL, -1, "measure font unselected");
+                st = GdiPaintDiscard(f, "measure font unselected", batch);
             }
         }
         ReleaseDC(NULL, dc);
@@ -2327,6 +2330,7 @@ static void TextAnnotRect(const Annot *a, RECT *out)
     out->top    = a->y;
     out->right  = a->x + s.cx;
     out->bottom = a->y + s.cy;
+    return st;
 }
 
 static void TextStart(int x, int y)
@@ -2335,13 +2339,19 @@ static void TextStart(int x, int y)
 
     /* 点在已有文字上 → 二次编辑它 */
     int hitIdx = -1;
+    GdiPaintBatch batch;
+    GdiBatchInit(&batch);
     for (int i = g_annCount - 1; i >= 0; i--) {
         if (g_ann[i].kind != AN_TEXT) continue;
         RECT r;
-        TextAnnotRect(&g_ann[i], &r);
+        TextAnnotRect(&g_ann[i], &r, &batch);
         r.left -= 4; r.top -= 4; r.right += 4; r.bottom += 4;   /* 放宽一点好点中 */
         if (PtIn(r, x, y)) { hitIdx = i; break; }
     }
+    /* 测量字体的释放结果必须在这里收口：先重试，再把仍交不出去的交给会话兜底 */
+    if (GdiBatchDrain(&batch) > 0)
+        QSLog("TextStart: %d 个测量字体句柄未能托管", batch.count);
+    GdiBatchAdopt(&batch);
 
     int fontH = (hitIdx >= 0) ? g_ann[hitIdx].fontH : g_textH[g_sizeLevel];
 
@@ -4757,15 +4767,41 @@ static void TestTextAnnotSelectFailure(void)
     DWORD g0 = GdiCount();
     g_gdiFailInject = 1;                   /* 让第一次 GdiSelect 失败 */
     RECT r;
-    TextAnnotRect(&a, &r);
+    GdiPaintBatch mb;
+    GdiBatchInit(&mb);
+    GdiReleaseStatus mst = TextAnnotRect(&a, &r, &mb);
     g_gdiFailInject = 0;
     DWORD g1 = GdiCount();
 
-    printf("text measure: injected select failure, rect %ldx%ld, gdi %lu -> %lu\n",
-           r.right - r.left, r.bottom - r.top, g0, g1);
+    printf("text measure: injected select failure, status=%d rect %ldx%ld, gdi %lu -> %lu\n",
+           (int)mst, r.right - r.left, r.bottom - r.top, g0, g1);
     TestCheck(r.left == a.x && r.top == a.y && r.right == r.left && r.bottom == r.top,
               "text measure: failed select yields zero-size rect");
+    TestCheck(mst == GdiRelFreed && GdiBatchDrain(&mb) == 0,
+              "text measure: failed select leaves nothing to the caller");
     TestCheck(g1 <= g0, "text measure: font not leaked on select failure");
+
+    /* 非 void 接口的关键路径：字体删不掉 + 节点分配失败时，
+     * 句柄必须落在调用方批次里，drain 后再进托管链表 */
+    int heldBase = g_gdiHeldCount;
+    GdiPaintBatch ob;
+    GdiBatchInit(&ob);
+    g_gdiDeleteFailInject = 1024;
+    g_gdiHeldFailInject   = 1;
+    GdiReleaseStatus ost = TextAnnotRect(&a, &r, &ob);
+    g_gdiDeleteFailInject = 0;
+    g_gdiHeldFailInject   = 0;
+    printf("text measure: oom path status=%d batch=%d held=%d\n",
+           (int)ost, ob.count, g_gdiHeldCount);
+    TestCheck(ost == GdiRelUnreleased && ob.count == 1 && ob.obj[0] != NULL,
+              "text measure: unreleased font is kept in caller batch");
+
+    g_gdiDeleteFailInject = 1024;          /* 仍然删不掉，但允许托管 */
+    TestCheck(GdiBatchDrain(&ob) == 0 && g_gdiHeldCount == heldBase + 1,
+              "text measure: batch drain hands font to custody");
+    g_gdiDeleteFailInject = 0;
+    GdiFlushDeferred();                    /* 屏幕 DC 已 Release，字体可真正删除 */
+    TestCheck(g_gdiHeldCount == heldBase, "text measure: custody releases after dc release");
 
     /* 绘制路径同理：只跳过这次绘制，不泄漏字体、不影响 DC */
     TestSurface s;
@@ -5353,9 +5389,10 @@ static int RunStabilityTest(void)
            g_gdiHeldAllocFailures, g_gdiDeferLostHandles, g_gdiUnreleasedInPaint);
     TestCheck(g_gdiHeldCount == 0 && g_gdiSessionBatch.count == 0,
               "no pending gdi objects at exit");
-    /* 3 次 allocFailures / 2 次 unreleased 来自容量测试的 OOM 注入，句柄最终都已找回 */
-    TestCheck(g_gdiHeldAllocFailures == 3 && g_gdiDeferLostHandles == 2 &&
-              g_gdiUnreleasedInPaint == 2,
+    /* 4 次 allocFailures / 3 次 unreleased 分别来自 TextAnnotRect 与容量测试的 OOM 注入，
+     * 句柄最终都已通过批次或链表找回 */
+    TestCheck(g_gdiHeldAllocFailures == 4 && g_gdiDeferLostHandles == 3 &&
+              g_gdiUnreleasedInPaint == 3,
               "injected oom fallbacks are counted and recovered");
 
     GdiDeferReleaseAll();                  /* 正式退出前的最后一次清理（静态存储无需 free） */
